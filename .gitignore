@@ -1,0 +1,9 @@
+﻿# ...existing code...
+__pycache__/
+*.pyc
+.env
+.venv
+env/
+output/
+logs/
+*.xlsx
