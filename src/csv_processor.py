@@ -429,13 +429,20 @@ class CSVProcessor:
         next_month = 1 if mes_usuario == 12 else mes_usuario + 1
         next_year = año_usuario + 1 if mes_usuario == 12 else año_usuario
         end_dt = datetime(next_year, next_month, 1, eh, em, 0)
+        # Generar rejilla completa 15 min entre inicio y fin detectados del mes
         full_range = pd.date_range(start_dt, end_dt, freq="15min", inclusive="both")
-        # Fuerza bruta: asegurar exactamente 2883 filas en la rejilla mensual
-        TARGET_ROWS = 2883
-        if len(full_range) != TARGET_ROWS:
-            # Mantiene el inicio intacto y extiende/recorta solo el final
-            full_range = pd.date_range(full_range[0], periods=TARGET_ROWS, freq="15min")
-            LOG.info(f"Rejilla ajustada a {TARGET_ROWS} filas.")
+        # Calcular filas esperadas según largo del mes (sin forzar un número fijo)
+        import calendar
+        dias_mes = calendar.monthrange(start_dt.year, start_dt.month)[1]
+        expected_rows = dias_mes * 24 * 4  # 96 intervalos por día
+        # Si falta último tramo, extender hasta final real del mes
+        if len(full_range) < expected_rows:
+            last_minute = datetime(start_dt.year, start_dt.month, dias_mes, 23, 45)
+            full_range = pd.date_range(start_dt, last_minute, freq="15min")
+            LOG.info(f"Rejilla extendida a {len(full_range)} filas (mes de {dias_mes} días).")
+        elif len(full_range) > expected_rows:
+            full_range = full_range[:expected_rows]
+            LOG.info(f"Rejilla recortada a {expected_rows} filas (mes de {dias_mes} días).")
         start_str = full_range.min().strftime("%d/%m/%Y %H:%M")
         end_str = full_range.max().strftime("%d/%m/%Y %H:%M")
 
