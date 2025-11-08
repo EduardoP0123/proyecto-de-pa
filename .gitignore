@@ -1,10 +1,21 @@
-﻿# ...existing code...
-__pycache__/
+﻿__pycache__/
 *.pyc
 .env
-.venv
+.venv/
 env/
-output/
+.vscode/
+.build/
+build/
+dist/
 logs/
-*.xlsx
+output/
+*.log
+*.spec
+.thumb/
+Thumbs.db
+# opcional: artefactos comprimidos de releases (si usas GitHub Releases no los subas al repo)
+# *.zip
+# *.exe
+
+# archivos locales
 excel_para_entender
