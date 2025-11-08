@@ -334,31 +334,6 @@ class CSVProcessor:
         out = pd.merge(kwh_agg, kvar_agg, on=ts_col, how="outer")
         return out
 
-    # ==================== USO EN analyze_folder ====================
-
-    # Dentro de analyze_folder, reemplaza ÚNICAMENTE el bloque donde hoy creas kwh/kvarh.
-    # No toques nada de fechas.
-    # Busca el lugar después de tener el timestamp ya parseado y filtrado al rango.
-    # Sustituye por esto:
-
-    # ts_col = 'timestamp_parsed' if 'timestamp_parsed' in raw.columns else 'timestamp'
-    # energy = self._aggregate_energy(raw.dropna(subset=[ts_col]), ts_col)
-    # in_month = energy[(energy[ts_col] >= full_range.min()) & (energy[ts_col] <= full_range.max())].copy()
-    # if not in_month.empty:
-    #     in_month = in_month.set_index(ts_col)
-    #     kwh_full = in_month['kwh_val'].reindex(full_range)
-    #     kvar_full = in_month['kvar_val'].reindex(full_range)
-    # else:
-    #     kwh_full = pd.Series(index=full_range, dtype="float64")
-    #     kvar_full = pd.Series(index=full_range, dtype="float64")
-    #
-    # out = pd.DataFrame({
-    #     "company": csv.stem,
-    #     "timestamp": full_range,
-    #     "kwh": kwh_full.values,
-    #     "kvarh": kvar_full.values
-    # })
-    # processed.append(out)
 
     def export_excel_multi_sheet(self, filename: str):
         """Exporta a Excel con una hoja por empresa + resumen combinado"""
