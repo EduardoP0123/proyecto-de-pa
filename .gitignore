@@ -14,6 +14,7 @@ output/
 .thumb/
 Thumbs.db
 ui/images
+examples/MEDICIONES ZFSI MES DE AGOSTO 2025 V2.xlsx
 # opcional: artefactos comprimidos de releases (si usas GitHub Releases no los subas al repo)
 # *.zip
 # *.exe

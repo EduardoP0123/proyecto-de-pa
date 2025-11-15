@@ -4,16 +4,15 @@ import threading
 import tkinter as tk
 from pathlib import Path
 import math
+import re
+from datetime import datetime, timedelta
 from tkinter import ttk, filedialog, messagebox
 from tkcalendar import DateEntry
-from datetime import datetime
 from collections import defaultdict
 import pandas as pd
-import re
 
-# Imagen (opcional, fallback si no hay Pillow)
 try:
-    from PIL import Image, ImageTk  # type: ignore[import]
+    from PIL import Image, ImageTk  
 except Exception:
     Image = ImageTk = None
 
@@ -25,6 +24,15 @@ except Exception:
     run_ui = None
 from src.csv_processor import CSVProcessor
 
+
+MONTH_ABBR_ES = {
+    1: "ene", 2: "feb", 3: "mar", 4: "abr", 5: "may", 6: "jun",
+    7: "jul", 8: "ago", 9: "sep", 10: "oct", 11: "nov", 12: "dic"
+}
+
+def format_es_date(d: datetime.date) -> str:
+    # 1-ago-25
+    return f"{d.day}-{MONTH_ABBR_ES.get(d.month, '')}-{d.strftime('%y')}"
 
 class CSVUploaderApp:
     def __init__(self, root):
@@ -54,6 +62,9 @@ class CSVUploaderApp:
         # UI
         self.create_widgets()
         self._build_statusbar()
+
+        self.company_multipliers = {}  # cache por empresa
+        self.last_report = None        # (df, totals, meta)
 
     # ---------- Estilo ----------
     def _init_style(self):
@@ -190,20 +201,42 @@ class CSVUploaderApp:
         self.end_min.set("59")
         self.end_min.grid(row=3, column=3, sticky="w", padx=(4, 0))
 
+        # Empresa y Multiplo
+        ttk.Label(opts, text="Empresa").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.company_cb = ttk.Combobox(opts, values=[], state="disabled", width=28)
+        self.company_cb.grid(row=4, column=1, columnspan=3, sticky="ew", padx=(8, 0), pady=(8, 0))
+        # Cuando cambia la empresa, sincronizar el multiplo mostrado
+        self.company_cb.bind('<<ComboboxSelected>>', self._on_company_selected)
+
+        ttk.Label(opts, text="Multiplo").grid(row=5, column=0, sticky="w")
+        self.multiplier_sp = ttk.Spinbox(opts, from_=1, to=100000, width=8)
+        self.multiplier_sp.set("80")
+        self.multiplier_sp.grid(row=5, column=1, sticky="w", padx=(8, 0))
+        # Guardar y propagar cambios de multiplo
+        try:
+            self.default_multiplier = 80
+        except Exception:
+            self.default_multiplier = 80
+        self.multiplier_sp.configure(command=self._on_multiplier_change)
+        self.multiplier_sp.bind('<FocusOut>', lambda e: self._on_multiplier_change())
+        self.multiplier_sp.bind('<Return>', lambda e: self._on_multiplier_change())
+
         # Botonera
         btns = ttk.Frame(opts)
-        btns.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(12, 0))
+        btns.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(12, 0))
         btns.columnconfigure(0, weight=1)
         ttk.Button(btns, text="Analizar CSV", style="Accent.TButton", command=self.analyze_folder).grid(row=0, column=0, sticky="ew")
         ttk.Button(btns, text="Analizar PRN", command=self.analyze_folder_prn).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        # Botones de exportación (inician deshabilitados)
+        # Exportaciones
         self.export_excel_btn = ttk.Button(btns, text="Exportar Excel", command=self.export_excel, state="disabled")
         self.export_excel_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self.export_csv_btn = ttk.Button(btns, text="Exportar CSV", command=self.export_csv, state="disabled")
         self.export_csv_btn.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
-        # Botón limpiar
+        # Limpiar y reporte
         self.clear_btn = ttk.Button(btns, text="Limpiar", command=self.clear_results)
-        self.clear_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.clear_btn.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.report_btn = ttk.Button(btns, text="Generar reporte mensual", command=self.generate_report, state="disabled")
+        self.report_btn.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
 
         # Panel de resultados (log)
         right = ttk.Labelframe(body, text="Registro y resultados", style="Section.TLabelframe")
@@ -250,6 +283,15 @@ class CSVUploaderApp:
         self.info_text.insert("end", text + "\n")
         self.info_text.see("end")
         self.info_text.configure(state="disabled")
+
+    def show_error(self, message: str):
+        try:
+            messagebox.showerror("Error", message)
+        finally:
+            try:
+                self.append_info(f"[ERROR] {message}")
+            except Exception:
+                pass
 
     def browse_folder(self):
         folder = filedialog.askdirectory(title="Selecciona carpeta con archivos")
@@ -474,101 +516,425 @@ class CSVUploaderApp:
         self.last_results = None
         self.csv_processor.combined_df = None
 
-    def on_analysis_done(self, ok: bool, msg: str, results: dict):
-        self.append_info(msg)
-        if ok and getattr(self.csv_processor, "combined_df", None) is not None:
-            self.last_results = results
-            if hasattr(self, "export_excel_btn"):
-                self.export_excel_btn.configure(state="normal")
-            if hasattr(self, "export_csv_btn"):
-                self.export_csv_btn.configure(state="normal")
-            cs = results.get("combined_stats", {})
-            self.append_info(f"Filas: {cs.get('total_rows', 0)}  Columnas: {cs.get('total_columns', 0)}  Resolución: {cs.get('resolution', '')}")
+    # --- Utilidades reporte ---
+    def populate_companies(self):
+        df = getattr(self.csv_processor, "combined_df", None)
+        if df is None or df.empty:
+            self.company_cb.configure(state="disabled", values=[])
+            self.report_btn.configure(state="disabled")
+            return
+        if "company" in df.columns:
+            companies = sorted([str(x) for x in df["company"].dropna().unique().tolist()])
         else:
-            self.append_info("Sin resultados para exportar.")
+            companies = ["General"]
+            df["company"] = "General"
+        self.company_cb.configure(state="readonly", values=companies)
+        if not self.company_cb.get():
+            self.company_cb.set(companies[0])
+        # Al poblar, refleja el multiplo para la empresa actual (si existe)
+        self._on_company_selected()
+        self.report_btn.configure(state="normal")
 
-    def show_error(self, msg: str):
-        self.append_info(f"[ERROR] {msg}")
+    # --- Multiplo por empresa: sincronización UI <-> cache ---
+    def _on_company_selected(self, event=None):
+        """Cuando el usuario selecciona una empresa, muestra su multiplo guardado
+        o el multiplo por defecto si no existe."""
+        company = self.company_cb.get()
+        if not company:
+            return
+        val = self.company_multipliers.get(company)
+        if val is None:
+            val = getattr(self, 'default_multiplier', 80)
         try:
-            messagebox.showerror("Error", msg)
+            self.multiplier_sp.set(str(int(val)))
         except Exception:
-            pass
+            self.multiplier_sp.set(str(val))
 
+    def _on_multiplier_change(self):
+        """Guarda el multiplo actual para la empresa seleccionada cuando cambia."""
+        company = self.company_cb.get()
+        if not company:
+            return
+        try:
+            m = float(self.multiplier_sp.get())
+        except Exception:
+            return
+        self.company_multipliers[company] = m
+
+    def _hourly_aggregate(self, df):
+        # Asegura timestamp datetime, agrega por hora
+        if "timestamp" not in df.columns:
+            return df.iloc[0:0].copy()
+        if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+            df = df.copy()
+            df["timestamp"] = pd.to_datetime(df["timestamp"].astype(str), errors="coerce", dayfirst=True)
+            df = df[pd.notna(df["timestamp"])]
+        df["hour_ts"] = df["timestamp"].dt.floor("H")
+        agg_cols = {}
+        if "kwh" in df.columns:
+            agg_cols["kwh"] = "sum"
+        if "kvarh" in df.columns:
+            agg_cols["kvarh"] = "sum"
+        if not agg_cols:
+            return df.iloc[0:0].copy()
+        g = df.groupby("hour_ts", as_index=True).agg(agg_cols)
+        return g
+
+    def compute_report_table(self, company: str, start_dt: datetime, end_dt: datetime, multiplo: float):
+        df = getattr(self.csv_processor, "combined_df", None)
+        if df is None or df.empty:
+            return pd.DataFrame(), {"kwh": 0.0, "kvarh": 0.0}, {}
+        # Filtrar por empresa y rango
+        if "company" in df.columns:
+            df = df[df["company"].astype(str) == str(company)].copy()
+        # Ajustar rango
+        if "timestamp" in df.columns:
+            if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
+                df["timestamp"] = pd.to_datetime(df["timestamp"].astype(str), errors="coerce", dayfirst=True)
+                df = df[pd.notna(df["timestamp"])]
+            df = df[(df["timestamp"] >= start_dt) & (df["timestamp"] <= end_dt)]
+        # Agregado por hora
+        hourly = self._hourly_aggregate(df)  # index: hour_ts
+        # Crear rejilla de días/24h
+        rows = []
+        cur = datetime(start_dt.year, start_dt.month, start_dt.day)
+        end_day = datetime(end_dt.year, end_dt.month, end_dt.day)
+        while cur <= end_day:
+            for h in range(24):
+                ts = cur + timedelta(hours=h)
+                kv = hourly.loc[ts] if ts in hourly.index else None
+                kwh = float(kv["kwh"]) if kv is not None and "kwh" in hourly.columns else 0.0
+                kvarh = float(kv["kvarh"]) if kv is not None and "kvarh" in hourly.columns else 0.0
+                # Aplicar multiplo a valores por hora
+                kwh_scaled = kwh * multiplo
+                kvarh_scaled = kvarh * multiplo
+                rows.append({
+                    "Fecha": format_es_date(cur.date()),
+                    "Hora": h + 1,  # 1..24
+                    "Kwh": round(kwh_scaled, 3),
+                    "Kvarh": round(kvarh_scaled, 3),
+                })
+            cur += timedelta(days=1)
+        report = pd.DataFrame(rows, columns=["Fecha", "Hora", "Kwh", "Kvarh"])
+        totals = {
+            # Totales = suma de valores ya multiplicados (NO se vuelve a multiplicar)
+            "kwh": float(report["Kwh"].sum()),
+            "kvarh": float(report["Kvarh"].sum()),
+        }
+        meta = {"company": company, "multiplo": multiplo}
+        return report, totals, meta
+
+    def generate_report(self):
+        df = getattr(self.csv_processor, "combined_df", None)
+        if df is None or df.empty:
+            messagebox.showinfo("Reporte", "No hay datos para generar reporte.")
+            return
+        company = self.company_cb.get() or ("General" if "company" not in df.columns else str(df["company"].iloc[0]))
+        try:
+            m = float(self.multiplier_sp.get())
+        except Exception:
+            m = 80.0
+        # Guardar preferencia por empresa
+        self.company_multipliers[company] = m
+        # Construir tabla
+        sdate = self.start_date.get_date(); edate = self.end_date.get_date()
+        sh, sm, eh, em = self._sanitize_time_inputs()
+        start_dt = datetime(sdate.year, sdate.month, sdate.day, 0, 0)
+        end_dt = datetime(edate.year, edate.month, edate.day, 23, 59)
+        report_df, totals, meta = self.compute_report_table(company, start_dt, end_dt, m)
+        if report_df.empty:
+            messagebox.showinfo("Reporte", "No se generaron filas para el rango seleccionado.")
+            return
+        self.last_report = {"df": report_df, "totals": totals, "meta": meta}
+        self.show_report_window(report_df, totals, meta)
+
+    def show_report_window(self, report_df: pd.DataFrame, totals: dict, meta: dict):
+        win = tk.Toplevel(self.root)
+        win.title(f"Reporte mensual - {meta.get('company','')}")
+        win.geometry("700x680")
+        top = ttk.Frame(win, padding=12)
+        top.pack(side="top", fill="x")
+        ttk.Label(top, text=f"Multiplo → {int(meta.get('multiplo', 0))}", font=("Segoe UI", 12, "bold")).pack(side="left")
+        sep = ttk.Frame(top); sep.pack(side="left", expand=True, fill="x")
+        ttk.Label(top, text=f"{totals['kwh']:,.3f}", font=("Segoe UI", 14, "bold"), foreground="#1b4f72").pack(side="left", padx=(8, 16))
+        ttk.Label(top, text=f"{totals['kvarh']:,.3f}", font=("Segoe UI", 14, "bold"), foreground="#1b4f72").pack(side="left")
+
+        # Tabla
+        cols = ("Fecha", "Hora", "Kwh", "Kvarh")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=24)
+        for c, w in [("Fecha", 120), ("Hora", 60), ("Kwh", 120), ("Kvarh", 120)]:
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="e" if c in ("Hora", "Kwh", "Kvarh") else "w")
+        # Volcado
+        for _, r in report_df.iterrows():
+            tree.insert("", "end", values=(r["Fecha"], f"{int(r['Hora'])}", f"{r['Kwh']:.3f}", f"{r['Kvarh']:.3f}"))
+        tree.pack(side="top", fill="both", expand=True, padx=12, pady=8)
+
+        # Botones export
+        btnf = ttk.Frame(win, padding=12)
+        btnf.pack(side="bottom", fill="x")
+        ttk.Button(btnf, text="Exportar reporte a Excel", command=self.export_report_excel).pack(side="right")
+
+    def export_report_excel(self):
+        if not self.last_report:
+            messagebox.showinfo("Exportar", "No hay reporte para exportar.")
+            return
+        report_df = self.last_report["df"]
+        totals = self.last_report["totals"]
+        meta = self.last_report["meta"]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            title="Guardar reporte mensual"
+        )
+        if not path:
+            return
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Reporte"
+
+            # Encabezado
+            ws["A1"] = "Multiplo →"
+            ws["B1"] = int(meta.get("multiplo", 0))
+            ws["C1"] = "Kwh"
+            ws["D1"] = "Kvarh"
+            ws["C2"] = totals["kwh"]
+            ws["D2"] = totals["kvarh"]
+            ws["C2"].number_format = "#,##0.000"
+            ws["D2"].number_format = "#,##0.000"
+            ws["A1"].font = Font(bold=True, size=12)
+            ws["C2"].font = Font(bold=True, size=14)
+            ws["D2"].font = Font(bold=True, size=14)
+
+            # Cabecera de tabla
+            headers = ["Fecha", "Hora", "Kwh", "Kvarh"]
+            ws.append([])  # fila 3 vacía
+            ws.append(headers)  # fila 4
+            hdr_fill = PatternFill("solid", fgColor="D9EAF7")
+            for col, h in enumerate(headers, start=1):
+                cell = ws.cell(row=4, column=col)
+                cell.fill = hdr_fill
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+
+            # Datos
+            thin = Side(style="thin", color="999999")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+            start_row = 5
+            for idx, r in report_df.iterrows():
+                row = start_row + idx
+                ws.cell(row=row, column=1, value=r["Fecha"])
+                ws.cell(row=row, column=2, value=int(r["Hora"]))
+                c3 = ws.cell(row=row, column=3, value=float(r["Kwh"]))
+                c4 = ws.cell(row=row, column=4, value=float(r["Kvarh"]))
+                c3.number_format = "#,##0.000"
+                c4.number_format = "#,##0.000"
+                for col in range(1, 5):
+                    ws.cell(row=row, column=col).border = border
+                # Colorear columnas Kwh/Kvarh
+                ws.cell(row=row, column=3).fill = PatternFill("solid", fgColor="E9F5FE")
+                ws.cell(row=row, column=4).fill = PatternFill("solid", fgColor="E9F5FE")
+
+            # Anchos
+            ws.column_dimensions["A"].width = 14
+            ws.column_dimensions["B"].width = 8
+            ws.column_dimensions["C"].width = 14
+            ws.column_dimensions["D"].width = 14
+
+            wb.save(path)
+            messagebox.showinfo("Exportar", f"Archivo guardado:\n{path}")
+        except Exception as e:
+            self.show_error(str(e))
+
+    # ---------- Exportaciones clásicas (Excel/CSV combinados) ----------
     def export_excel(self):
+        """Exporta a Excel con una hoja por empresa e incluye Totales y Multiplo al inicio.
+        Los totales se calculan como suma(Kwh) y suma(Kvarh) del rango analizado y se multiplican
+        por el multiplo de la empresa (si existe) o el actual del spinner como valor por defecto.
+        """
         df = getattr(self.csv_processor, "combined_df", None)
         if df is None or df.empty:
             messagebox.showinfo("Exportar", "No hay datos para exportar.")
             return
+
+        # Ruta de guardado
         path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel", "*.xlsx")],
-            title="Guardar como Excel"
+            title="Guardar Excel (multi-hoja)"
         )
         if not path:
             return
 
-        def sanitize_sheet_name(name: str, used: set) -> str:
-            base = re.sub(r'[\\/*?:\[\]]', "_", str(name)) or "Hoja"
-            base = base[:31]
-            # Evitar nombres reservados como 'History' en algunos builds
-            if base.strip().lower() in {"history"}:
-                base = f"_{base}"
-            candidate = base
-            i = 1
-            while candidate in used or len(candidate) == 0:
-                suffix = f"_{i}"
-                candidate = (base[: max(0, 31 - len(suffix))] + suffix) or f"Hoja_{i}"
-                i += 1
-            used.add(candidate)
-            return candidate
-
-        def apply_datetime_format(writer, sheet_name: str, df_sheet: pd.DataFrame):
-            """Aplica formato dd/mm/yy hh:mm a columnas datetime."""
-            try:
-                ws = writer.sheets[sheet_name]
-                from openpyxl.styles import numbers  # noqa: F401
-                for j, col in enumerate(df_sheet.columns, start=1):
-                    if pd.api.types.is_datetime64_any_dtype(df_sheet[col]):
-                        for col_cells in ws.iter_cols(min_col=j, max_col=j, min_row=2, max_row=ws.max_row):
-                            for cell in col_cells:
-                                cell.number_format = "dd/mm/yy hh:mm"
-            except Exception:
-                # Si openpyxl no está, simplemente no se aplica formato
-                pass
+        # Solo aplicar el multiplo del spinner a la empresa seleccionada;
+        # las demás usan su valor guardado (o 1.0 por defecto)
+        selected_company = self.company_cb.get() or None
+        try:
+            selected_multiplo = float(self.multiplier_sp.get())
+        except Exception:
+            selected_multiplo = None
 
         try:
-            with pd.ExcelWriter(path, engine="openpyxl") as writer:
-                used_names = set()
-                # 1) Hoja por empresa
-                if "company" in df.columns:
-                    for comp, grp in df.groupby(df["company"].astype(str), dropna=True):
-                        sheet = sanitize_sheet_name(f"{comp}", used_names)
-                        grp.to_excel(writer, index=False, sheet_name=sheet)
-                        apply_datetime_format(writer, sheet, grp)
-                    # 2) Resumen
-                    resumen_cols = [c for c in ["kwh", "kvarh"] if c in df.columns]
-                    if resumen_cols:
-                        resumen = df.groupby(df["company"].astype(str), as_index=False)[resumen_cols].sum()
-                    else:
-                        resumen = df.groupby(df["company"].astype(str), as_index=False).size().rename(columns={"size": "rows"})
-                    resumen_sheet = sanitize_sheet_name("Resumen", used_names)
-                    resumen.to_excel(writer, index=False, sheet_name=resumen_sheet)
-                # 3) Combinado
-                comb_sheet = sanitize_sheet_name("Combinado", used_names)
-                df.to_excel(writer, index=False, sheet_name=comb_sheet)
-                apply_datetime_format(writer, comb_sheet, df)
-                # 4) Detalles
-                details = None
-                if hasattr(self, "last_results") and isinstance(self.last_results, dict):
-                    details = self.last_results.get("file_details")
-                if details:
-                    try:
-                        det_df = pd.DataFrame(details)
-                        det_sheet = sanitize_sheet_name("Detalles", used_names)
-                        det_df.to_excel(writer, index=False, sheet_name=det_sheet)
-                    except Exception:
-                        pass
-            messagebox.showinfo("Exportar", f"Archivo guardado:\n{path}")
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+
+            # Preparar datos: formatear timestamp a texto día/mes/año HH:MM:SS
+            data = df.copy()
+            if "timestamp" in data.columns and not data["timestamp"].isna().all():
+                if pd.api.types.is_datetime64_any_dtype(data["timestamp"]):
+                    data["timestamp"] = data["timestamp"].dt.strftime("%d/%m/%Y %H:%M:%S")
+                else:
+                    ts = pd.to_datetime(data["timestamp"].astype(str), errors="coerce", dayfirst=True)
+                    data["timestamp"] = ts.dt.strftime("%d/%m/%Y %H:%M:%S")
+
+            # Crear libro, estilos y hoja TOTAL (primera)
+            wb = Workbook()
+            hdr_fill = PatternFill("solid", fgColor="D9EAF7")
+            light_fill = PatternFill("solid", fgColor="E9F5FE")
+            thin = Side(style="thin", color="999999")
+            border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+            ws_total = wb.active
+            ws_total.title = "total"
+
+            # Cabecera TOTAL
+            total_headers = ["No.", "Cliente", "Multiplo", "KWh", "KVARh", "KW"]
+            ws_total.append(total_headers)
+            for c in range(1, len(total_headers) + 1):
+                cell = ws_total.cell(row=1, column=c)
+                cell.fill = hdr_fill
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+
+            # Preparar compañías y mapa nombre->hoja
+            companies = sorted([str(x) for x in data["company"].dropna().unique()]) if "company" in data.columns else ["General"]
+            if "company" not in data.columns:
+                data["company"] = "General"
+
+            # Helper para nombre de hoja único (cap Excel 31 chars)
+            used_titles = set([ws_total.title])
+            def unique_title(base: str) -> str:
+                t = str(base)[:31]
+                if t not in used_titles:
+                    used_titles.add(t); return t
+                i = 2
+                while True:
+                    cand = (str(base)[:31-len(str(i))-1] + f" {i}") if len(str(base)) >= 31 else f"{str(base)} {i}"
+                    cand = cand[:31]
+                    if cand not in used_titles:
+                        used_titles.add(cand); return cand
+                    i += 1
+
+            sheet_by_company = {}
+
+            # Crear hojas por empresa y recolectar totales + rango para KW
+            total_rows = []
+            for idx, company in enumerate(companies, start=1):
+                 # Resolver multiplo por empresa: usa el guardado; si no existe, el valor por defecto (spinner inicial)
+                m = float(self.company_multipliers.get(company, getattr(self, 'default_multiplier', 80)))
+                if selected_company and company == selected_company and (selected_multiplo is not None):
+                    m = float(selected_multiplo)
+                    # Actualizar cache para esta empresa únicamente
+                    self.company_multipliers[company] = m
+                cdf = data[data["company"].astype(str) == company].copy()
+
+                # Totales multiplicados para TOTAL
+                kwh_sum = float(pd.to_numeric(cdf.get("kwh"), errors="coerce").sum()) if "kwh" in cdf.columns else 0.0
+                kvar_sum = float(pd.to_numeric(cdf.get("kvarh"), errors="coerce").sum()) if "kvarh" in cdf.columns else 0.0
+                kwh_total = kwh_sum * m
+                kvar_total = kvar_sum * m
+
+                # Hoja empresa
+                sheet_name = unique_title(company)
+                ws = wb.create_sheet(title=sheet_name)
+                sheet_by_company[company] = sheet_name
+
+                # Encabezado Totales/Multiplo
+                ws["A1"] = "Multiplo →"; ws["A1"].font = Font(bold=True, size=12)
+                ws["B1"] = int(m)
+                # Colocar directamente los totales numéricos en D1 y E1 como solicitaste
+                ws["C1"] = "Kwh"; ws["C1"].font = Font(bold=True, size=12)
+                ws["D1"] = kwh_total; ws["D1"].number_format = "#,##0.000"; ws["D1"].font = Font(bold=True, size=14)
+                ws["E1"] = kvar_total; ws["E1"].number_format = "#,##0.000"; ws["E1"].font = Font(bold=True, size=14)
+
+                # Cabeceras de tabla
+                ws.append([])  # fila 3
+                cols = []
+                for name in ["timestamp", "Hora", "company", "kwh", "kvarh"]:
+                    if name in cdf.columns and name not in cols:
+                        cols.append(name)
+                for name in cdf.columns:
+                    if name not in cols:
+                        cols.append(name)
+                ws.append(cols)  # fila 4
+                for col_idx, h in enumerate(cols, start=1):
+                    cell = ws.cell(row=4, column=col_idx)
+                    cell.fill = hdr_fill
+                    cell.font = Font(bold=True)
+                    cell.alignment = Alignment(horizontal="center")
+
+                # Datos
+                start_row = 5
+                for ridx, (_, row) in enumerate(cdf.iterrows(), start=start_row):
+                    for cidx, col_name in enumerate(cols, start=1):
+                        val = row.get(col_name)
+                        cell = ws.cell(row=ridx, column=cidx, value=val if pd.notna(val) else None)
+                        cell.border = border
+                        if col_name.lower() in ("kwh", "kvarh"):
+                            cell.number_format = "#,##0.000"
+                            cell.fill = light_fill
+
+                # Anchos
+                ws.column_dimensions["A"].width = max(14, min(28, len(str(cols[0])) + 6)) if cols else 14
+                ws.column_dimensions["B"].width = 10
+                ws.column_dimensions["C"].width = 16
+                ws.column_dimensions["D"].width = 16
+
+                # Guardar info para TOTAL (hipervínculo y fórmula KW)
+                last_row = start_row + max(len(cdf), 1) - 1
+                if len(cdf) <= 0:
+                    kw_formula = 0
+                else:
+                    # Kwh está en columna D por el orden definido
+                    esc = sheet_name.replace("'", "''")
+                    kw_formula = f"=MAX('{esc}'!$D${start_row}:$D${last_row})"
+                total_rows.append((idx, company, m, kwh_total, kvar_total, kw_formula, esc, start_row, last_row))
+
+            # Volcar TOTAL con hipervínculos
+            for r_idx, (no, company, m, kwh_t, kvar_t, kw_formula, esc, srow, lrow) in enumerate(total_rows, start=2):
+                ws_total.cell(row=r_idx, column=1, value=no)
+                c_name = ws_total.cell(row=r_idx, column=2, value=company)
+                sheet_name = sheet_by_company[company]
+                esc = sheet_name.replace("'", "''")
+                # Hipervínculo con nombre de hoja entre comillas simples
+                c_name.hyperlink = f"#'{esc}'!A1"
+                c_name.font = Font(color="0563C1", underline="single")
+                ws_total.cell(row=r_idx, column=3, value=int(m))
+                # KWh/KVARh en TOTAL con respaldo: si D1/E1 no son números, sumar columna de datos
+                c4 = ws_total.cell(row=r_idx, column=4)
+                c4.value = f"=IF(ISNUMBER('{esc}'!$D$1), '{esc}'!$D$1, SUM('{esc}'!$D${srow}:'{esc}'!$D${lrow}))"; c4.number_format = "#,##0.000"
+                c5 = ws_total.cell(row=r_idx, column=5)
+                c5.value = f"=IF(ISNUMBER('{esc}'!$E$1), MAX('{esc}'!$E$1), SUM('{esc}'!$E${srow}:'{esc}'!$E${lrow}))"; c5.number_format = "#,##0.000"
+                c6 = ws_total.cell(row=r_idx, column=6)
+                if isinstance(kw_formula, str):
+                    c6.value = kw_formula
+                else:
+                    c6.value = 0
+                c6.number_format = "#,##0.000"
+
+            # Anchos TOTAL
+            ws_total.column_dimensions["A"].width = 6
+            ws_total.column_dimensions["B"].width = 34
+            ws_total.column_dimensions["C"].width = 10
+            ws_total.column_dimensions["D"].width = 16
+            ws_total.column_dimensions["E"].width = 16
+            ws_total.column_dimensions["F"].width = 12
+
+            wb.save(path)
+            messagebox.showinfo("Exportar", f"Excel exportado: {path}")
         except Exception as e:
             self.show_error(str(e))
 
@@ -580,36 +946,30 @@ class CSVUploaderApp:
         path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
-            title="Guardar como CSV"
+            title="Guardar CSV combinado"
         )
         if not path:
             return
-        try:
-            out = df.copy()
-            if "timestamp" in out.columns and pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
-                out["timestamp"] = out["timestamp"].dt.strftime("%d/%m/%y %H:%M")
-            # Si existen otras columnas datetime y quieres formatearlas también:
-            # for c in out.select_dtypes(include=["datetime64[ns]"]).columns:
-            #     out[c] = out[c].dt.strftime("%d/%m/%y %H:%M")
-            out.to_csv(path, index=False, encoding="utf-8-sig")
-            messagebox.showinfo("Exportar", f"Archivo guardado:\n{path}")
-        except Exception as e:
-            self.show_error(str(e))
+        ok, msg = self.csv_processor.export_combined_csv(path)
+        if ok:
+            messagebox.showinfo("Exportar", msg)
+        else:
+            messagebox.showerror("Exportar", msg)
 
-    def clear_data(self):
-        self.folder_path.delete(0, 'end')
-        if hasattr(self.csv_processor, 'clear_data'):
-            self.csv_processor.clear_data()
-        self.info_text.configure(state="normal")
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.configure(state="disabled")
-        self.export_excel_btn.configure(state="disabled")
-        self.export_csv_btn.configure(state="disabled")
-
-def main():
-    root = tk.Tk()
-    app = CSVUploaderApp(root)
-    root.mainloop()
-
-if __name__ == "__main__":
-    main()
+    # ...existing code on_analysis_done...
+    def on_analysis_done(self, ok: bool, msg: str, results: dict):
+        self.append_info(msg)
+        if ok and getattr(self.csv_processor, "combined_df", None) is not None:
+            self.last_results = results
+            if hasattr(self, "export_excel_btn"):
+                self.export_excel_btn.configure(state="normal")
+            if hasattr(self, "export_csv_btn"):
+                self.export_csv_btn.configure(state="normal")
+            # Habilitar selección de empresa y reporte
+            self.populate_companies()
+            cs = results.get("combined_stats", {})
+            self.append_info(f"Filas: {cs.get('total_rows', 0)}  Columnas: {cs.get('total_columns', 0)}  Resolución: {cs.get('resolution', '')}")
+        else:
+            self.append_info("Sin resultados para exportar.")
+            self.company_cb.configure(state="disabled")
+            self.report_btn.configure(state="disabled")
