@@ -13,6 +13,7 @@ output/
 *.spec
 .thumb/
 Thumbs.db
+ui/images
 # opcional: artefactos comprimidos de releases (si usas GitHub Releases no los subas al repo)
 # *.zip
 # *.exe

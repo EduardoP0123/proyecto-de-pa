@@ -1,222 +1,408 @@
-import tkinter as tk
 import os
+import sys
+import threading
+import tkinter as tk
 from pathlib import Path
+import math
 from tkinter import ttk, filedialog, messagebox
 from tkcalendar import DateEntry
 from datetime import datetime
-import sys
-import pandas as pd
 from collections import defaultdict
-import threading
+import pandas as pd
+import re
+
+# Imagen (opcional, fallback si no hay Pillow)
+try:
+    from PIL import Image, ImageTk  # type: ignore[import]
+except Exception:
+    Image = ImageTk = None
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
+try:
+    from src.ui_components import run_ui
+except Exception:
+    run_ui = None
+from src.csv_processor import CSVProcessor
 
-from src.ui_components import run_ui
 
 class CSVUploaderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Procesador de Carpeta CSV - BILLREAD")
-        self.root.geometry("820x560")
-        self.root.resizable(True, True)
+        self.root.title("Lecturas KV2C - v2.0")
+        # Escalado para pantallas FHD/4K
+        try:
+            self.root.tk.call("tk", "scaling", 1.25)
+        except Exception:
+            pass
 
-        workspace_path = Path.home() / "Downloads" / f"BILLREAD_WORKSPACE_{Path(__file__).parent.name}"
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        self.csv_processor = run_ui(workspace_path)
+        self._init_style()
 
-        self.create_widgets()
-
-    def create_widgets(self):
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.N, tk.S, tk.E, tk.W))
-        self.root.columnconfigure(0, weight=1)
+        self.root.geometry("980x680")
+        self.root.minsize(900, 600)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
 
-        title_label = ttk.Label(main_frame, text="Procesador de Carpeta CSV - BILLREAD", font=("Arial", 16, "bold"))
-        title_label.grid(row=0, column=0, columnspan=4, pady=(0, 20))
+        # referencia del logo para evitar GC
+        self.seg_logo_img = None
 
-        ttk.Label(main_frame, text="Carpeta:").grid(row=1, column=0, sticky="w", pady=5)
-        self.folder_path = ttk.Entry(main_frame)
-        self.folder_path.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(10, 10))
-        ttk.Button(main_frame, text="Seleccionar Carpeta", command=self.browse_folder).grid(row=1, column=3, sticky="e")
+        # Procesador
+        workspace_path = Path.home() / "Downloads" / "BILLREAD_WORKSPACE"
+        workspace_path.mkdir(parents=True, exist_ok=True)
+        self.csv_processor = run_ui(workspace_path) if run_ui else CSVProcessor(workspace_path)
 
-        date_frame = ttk.LabelFrame(main_frame, text="Rango de análisis", padding="10")
-        date_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=15)
-        for c in range(10):
-            date_frame.columnconfigure(c, weight=0)
-        date_frame.columnconfigure(1, weight=1)
-        date_frame.columnconfigure(6, weight=1)
+        # UI
+        self.create_widgets()
+        self._build_statusbar()
 
-        # ---------------- Inicio (FECHA + HORA) ----------------
-        ttk.Label(date_frame, text="Fecha de inicio:").grid(row=0, column=0, sticky="w")
-        now = datetime.now()
-        self.start_date = DateEntry(date_frame, date_pattern="dd/mm/yyyy")
-        self.start_date.set_date(now)
-        self.start_date.grid(row=0, column=1, sticky="w", padx=(0, 18))
+    # ---------- Estilo ----------
+    def _init_style(self):
+        style = ttk.Style()
+        # Tema estable y moderno
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        # Colores base
+        self.COLOR_BG = "#0D1B2A"   # azul oscuro header
+        self.COLOR_ACCENT = "#1B6F9B"
+        self.COLOR_BTN = "#1F7A8C"
 
-        ttk.Label(date_frame, text="Hora inicio (HH:MM):").grid(row=0, column=3, sticky="e")
-        self.start_hour = ttk.Combobox(date_frame, values=[f"{h:02d}" for h in range(24)], width=3, state="readonly")
-        self.start_min = ttk.Combobox(date_frame, values=["00", "15", "30", "45"], width=3, state="readonly")
+        style.configure("Header.TFrame", background=self.COLOR_BG)
+        style.configure("Header.TLabel", background=self.COLOR_BG, foreground="white", font=("Segoe UI", 16, "bold"))
+        style.configure("TLabel", font=("Segoe UI", 10))
+        style.configure("TButton", font=("Segoe UI", 10))
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), foreground="white", background=self.COLOR_BTN)
+        style.map("Accent.TButton", background=[("active", "#2390A6"), ("disabled", "#9fb6bf")])
+        style.configure("Card.TFrame", padding=12)
+        style.configure("Section.TLabelframe", padding=12)
+        style.configure("Section.TLabelframe.Label", font=("Segoe UI", 11, "bold"))
+
+    # ---------- Logo ----------
+    def _load_seg_logo(self, max_h=56, max_w=220):
+        """Carga y escala el logo buscando en ui/images y assets."""
+        try:
+            here = Path(__file__).resolve().parent
+            roots = [
+                here / "images",                    
+                here.parent / "assets",             
+                Path.cwd() / "ui" / "images",       
+                Path.cwd() / "assets",
+            ]
+            candidates = [
+                "seg.png", "SEG.png", "seg_logo.png",
+                "seg.jpg", "SEG.jpg", "seg_logo.jpg",
+                "seg.gif", "SEG.gif"
+            ]
+            for root in roots:
+                for name in candidates:
+                    p = root / name
+                    if not p.exists():
+                        continue
+                    # Con Pillow (admite JPG/PNG/GIF y mejor escalado)
+                    if Image and ImageTk:
+                        img = Image.open(p).convert("RGBA")
+                        r = min(max_h / img.height, max_w / img.width, 1.0)
+                        new_size = (max(1, int(img.width * r)), max(1, int(img.height * r)))
+                        img = img.resize(new_size, Image.LANCZOS)
+                        return ImageTk.PhotoImage(img)
+                    # Fallback sin Pillow: PhotoImage (PNG/GIF)
+                    pic = tk.PhotoImage(file=str(p))
+                    h, w = pic.height(), pic.width()
+                    factor = max(1, math.ceil(max(h / max_h, w / max_w)))
+                    if factor > 1:
+                        pic = pic.subsample(factor, factor)
+                    return pic
+        except Exception as e:
+            try:
+                self.append_info(f"[LOGO] No se pudo cargar: {e}")
+            except Exception:
+                pass
+        # Aviso si no se encontró
+        try:
+            self.append_info("[LOGO] No se encontró imagen en ui/images o assets (ej: ui/images/seg.png).")
+        except Exception:
+            pass
+        return None
+
+    # ---------- Layout ----------
+    def create_widgets(self):
+        root_frame = ttk.Frame(self.root, padding=0)
+        root_frame.grid(row=0, column=0, sticky="nsew")
+        root_frame.rowconfigure(1, weight=1)
+        root_frame.columnconfigure(0, weight=1)
+
+        # Header
+        header = ttk.Frame(root_frame, style="Header.TFrame", padding=(16, 12))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        ttk.Label(header, text="Lecturas KV2C / KV2A analyzer", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+        self.seg_logo_img = self._load_seg_logo()
+        if self.seg_logo_img:
+            ttk.Label(header, image=self.seg_logo_img, style="Header.TLabel").grid(row=0, column=1, sticky="e")
+        else:
+            ttk.Label(header, text="SEG", style="Header.TLabel").grid(row=0, column=1, sticky="e")
+
+        # Body: panel izquierdo opciones, derecho log
+        body = ttk.Frame(root_frame, padding=12)
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        # Panel opciones (card)
+        opts = ttk.Labelframe(body, text="Opciones", style="Section.TLabelframe")
+        opts.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        for i in range(6):
+            opts.columnconfigure(i, weight=0)
+
+        # Carpeta
+        ttk.Label(opts, text="Carpeta").grid(row=0, column=0, sticky="w")
+        self.folder_path = ttk.Entry(opts, width=40)
+        self.folder_path.grid(row=0, column=1, columnspan=4, sticky="ew", padx=8)
+        ttk.Button(opts, text="Examinar...", command=self.browse_folder).grid(row=0, column=5, sticky="e")
+
+        # Resolución
+        ttk.Label(opts, text="Resolución").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.resolution = ttk.Combobox(opts, values=["15min", "1h"], state="readonly", width=8)
+        self.resolution.set("15min")
+        self.resolution.grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        # Rango fechas/horas
+        ttk.Label(opts, text="Inicio").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.start_date = DateEntry(opts, date_pattern="dd/mm/y", width=10)
+        self.start_date.grid(row=2, column=1, sticky="w", padx=(8, 4), pady=(8, 0))
+        self.start_hour = ttk.Spinbox(opts, from_=0, to=23, width=3)
         self.start_hour.set("00")
+        self.start_hour.grid(row=2, column=2, sticky="w", pady=(8, 0))
+        self.start_min = ttk.Spinbox(opts, from_=0, to=59, width=3)
         self.start_min.set("00")
-        self.start_hour.grid(row=0, column=4, sticky="w")
-        ttk.Label(date_frame, text=":").grid(row=0, column=5, sticky="w")
-        self.start_min.grid(row=0, column=6, sticky="w", padx=(0, 18))
+        self.start_min.grid(row=2, column=3, sticky="w", padx=(4, 0), pady=(8, 0))
 
-        # ---------------- Fin (FECHA + HORA) ----------------
-        ttk.Label(date_frame, text="Fecha de fin:").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.end_date = DateEntry(date_frame, date_pattern="dd/mm/yyyy")
-        self.end_date.set_date(now)
-        self.end_date.grid(row=1, column=1, sticky="w", padx=(0, 0), pady=(8, 0))
+        ttk.Label(opts, text="Fin").grid(row=3, column=0, sticky="w")
+        self.end_date = DateEntry(opts, date_pattern="dd/mm/y", width=10)
+        self.end_date.grid(row=3, column=1, sticky="w", padx=(8, 4))
+        self.end_hour = ttk.Spinbox(opts, from_=0, to=23, width=3)
+        self.end_hour.set("23")
+        self.end_hour.grid(row=3, column=2, sticky="w")
+        self.end_min = ttk.Spinbox(opts, from_=0, to=59, width=3)
+        self.end_min.set("59")
+        self.end_min.grid(row=3, column=3, sticky="w", padx=(4, 0))
 
-        ttk.Label(date_frame, text="Hora fin (HH:MM):").grid(row=1, column=3, sticky="e", pady=(8, 0))
-        self.end_hour = ttk.Combobox(date_frame, values=[f"{h:02d}" for h in range(24)], width=3, state="readonly")
-        self.end_min = ttk.Combobox(date_frame, values=["00", "15", "30", "45"], width=3, state="readonly")
-        self.end_hour.set("00")
-        self.end_min.set("15")
-        self.end_hour.grid(row=1, column=4, sticky="w", pady=(8, 0))
-        ttk.Label(date_frame, text=":").grid(row=1, column=5, sticky="w", pady=(8, 0))
-        self.end_min.grid(row=1, column=6, sticky="w", pady=(8, 0))
+        # Botonera
+        btns = ttk.Frame(opts)
+        btns.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(12, 0))
+        btns.columnconfigure(0, weight=1)
+        ttk.Button(btns, text="Analizar CSV", style="Accent.TButton", command=self.analyze_folder).grid(row=0, column=0, sticky="ew")
+        ttk.Button(btns, text="Analizar PRN", command=self.analyze_folder_prn).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        # Botones de exportación (inician deshabilitados)
+        self.export_excel_btn = ttk.Button(btns, text="Exportar Excel", command=self.export_excel, state="disabled")
+        self.export_excel_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.export_csv_btn = ttk.Button(btns, text="Exportar CSV", command=self.export_csv, state="disabled")
+        self.export_csv_btn.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        # Botón limpiar
+        self.clear_btn = ttk.Button(btns, text="Limpiar", command=self.clear_results)
+        self.clear_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
-        ttk.Button(main_frame, text="Analizar Carpeta", command=self.analyze_folder).grid(row=3, column=0, columnspan=4, pady=15)
+        # Panel de resultados (log)
+        right = ttk.Labelframe(body, text="Registro y resultados", style="Section.TLabelframe")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
 
-        info_frame = ttk.LabelFrame(main_frame, text="Información del Procesamiento", padding="10")
-        info_frame.grid(row=4, column=0, columnspan=4, sticky="nsew")
-        main_frame.rowconfigure(4, weight=1)
-        info_frame.columnconfigure(0, weight=1)
-        info_frame.rowconfigure(0, weight=1)
-
-        self.info_text = tk.Text(info_frame, height=12, wrap=tk.WORD, state="disabled", bg="#f7f7f7")
+        self.info_text = tk.Text(right, height=20, wrap="word", font=("Consolas", 10))
+        yscroll = ttk.Scrollbar(right, orient="vertical", command=self.info_text.yview)
+        self.info_text.configure(yscrollcommand=yscroll.set)
         self.info_text.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.info_text.yview)
-        sb.grid(row=0, column=1, sticky="ns")
-        self.info_text.configure(yscrollcommand=sb.set)
+        yscroll.grid(row=0, column=1, sticky="ns")
 
-        actions = ttk.Frame(main_frame)
-        actions.grid(row=5, column=0, columnspan=4, pady=10)
-        self.export_excel_btn = ttk.Button(actions, text="Exportar Excel Multi-Hoja", command=self.export_excel, state="disabled")
-        self.export_csv_btn = ttk.Button(actions, text="Exportar CSV Combinado", command=self.export_csv, state="disabled")
-        clear_btn = ttk.Button(actions, text="Limpiar", command=self.clear_data)
-        self.export_excel_btn.grid(row=0, column=0, padx=6)
-        self.export_csv_btn.grid(row=0, column=1, padx=6)
-        clear_btn.grid(row=0, column=2, padx=6)
+        # Permitir expandir el panel derecho
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+    def _build_statusbar(self):
+        bar = ttk.Frame(self.root, padding=(12, 6))
+        bar.grid(row=2, column=0, sticky="ew")
+        bar.columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(bar, text="Listo")
+        self.status_label.grid(row=0, column=0, sticky="w")
+        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=160)
+        self.progress.grid(row=0, column=1, sticky="e")
+
+    # ---------- Utilidades UI ----------
+    def set_busy(self, busy: bool, msg: str = ""):
+        if busy:
+            self.status_label.config(text=msg or "Procesando…")
+            try:
+                self.progress.start(12)
+            except Exception:
+                pass
+        else:
+            try:
+                self.progress.stop()
+            except Exception:
+                pass
+            self.status_label.config(text=msg or "Listo")
+
+    def append_info(self, text):
+        self.info_text.configure(state="normal")
+        self.info_text.insert("end", text + "\n")
+        self.info_text.see("end")
+        self.info_text.configure(state="disabled")
 
     def browse_folder(self):
-        folder_path = filedialog.askdirectory(title="Seleccionar carpeta con archivos CSV")
-        if folder_path:
-            self.folder_path.delete(0, 'end')
-            self.folder_path.insert(0, folder_path)
+        folder = filedialog.askdirectory(title="Selecciona carpeta con archivos")
+        if folder:
+            self.folder_path.delete(0, tk.END)
+            self.folder_path.insert(0, folder)
 
+    # ---------- Saneo de horas/minutos ----------
+    def _sanitize_time_inputs(self):
+        def to_int(v, default):
+            try:
+                return int(str(v).strip())
+            except Exception:
+                return default
+        def clamp(v, lo, hi):
+            return max(lo, min(hi, v))
+        sh = clamp(to_int(self.start_hour.get(), 0), 0, 23)
+        sm = clamp(to_int(self.start_min.get(), 0), 0, 59)
+        eh = clamp(to_int(self.end_hour.get(), 23), 0, 23)
+        em = clamp(to_int(self.end_min.get(), 59), 0, 59)
+        # Reflejar en la UI por si el usuario puso 60, etc.
+        try:
+            self.start_hour.set(f"{sh:02d}")
+            self.start_min.set(f"{sm:02d}")
+            self.end_hour.set(f"{eh:02d}")
+            self.end_min.set(f"{em:02d}")
+        except Exception:
+            pass
+        return sh, sm, eh, em
+
+    # ---------- Acciones ----------
     def analyze_folder(self):
+        self._run_analysis("csv")
+
+    def analyze_folder_prn(self):
+        self._run_analysis("prn")
+
+    def _run_analysis(self, file_type="csv"):
         folder_path = self.folder_path.get()
         if not folder_path or not os.path.exists(folder_path):
             messagebox.showerror("Error", "Selecciona una carpeta válida")
             return
 
-        # Tomar fecha de inicio (se usa solo su mes y año para el backend actual)
-        try:
-            start_date = self.start_date.get_date()
-            mes_usuario = int(start_date.month)
-            año_usuario = int(start_date.year)
-        except Exception:
-            messagebox.showerror("Error", "Selecciona una fecha de inicio válida")
+        # Fechas y horas
+        sdate = self.start_date.get_date()
+        edate = self.end_date.get_date()
+        sh, sm, eh, em = self._sanitize_time_inputs()
+        start_dt = datetime(sdate.year, sdate.month, sdate.day, sh, sm)
+        end_dt = datetime(edate.year, edate.month, edate.day, eh, em)
+        if end_dt < start_dt:
+            messagebox.showerror("Error", "El fin debe ser posterior al inicio")
             return
 
-        # Fecha fin (solo UI, servirá para recortar y para decidir meses a procesar)
-        end_date_ui = self.end_date.get_date()
+        resolution = self.resolution.get()
 
-        start_time = f"{self.start_hour.get()}:{self.start_min.get()}"
-        end_time = f"{self.end_hour.get()}:{self.end_min.get()}"
-
-        # Construir datetimes exactos de usuario para recortar al final
-        try:
-            sh, sm = map(int, start_time.split(":"))
-            eh, em = map(int, end_time.split(":"))
-            user_start_dt = datetime(start_date.year, start_date.month, start_date.day, sh, sm, 0)
-            user_end_dt = datetime(end_date_ui.year, end_date_ui.month, end_date_ui.day, eh, em, 0)
-        except Exception:
-            messagebox.showerror("Error", "Horas inválidas")
-            return
-        if user_end_dt < user_start_dt:
-            messagebox.showerror("Error", "La fecha/hora de fin debe ser posterior al inicio")
-            return
-
-        # Limpia y muestra mensaje inicial
+        # Preparar UI
         self.info_text.configure(state="normal")
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(tk.END, "Procesando, por favor espera...\n")
+        self.info_text.delete("1.0", "end")
         self.info_text.configure(state="disabled")
-        # Deshabilita botones mientras procesa
-        self.export_excel_btn.configure(state="disabled")
-        self.export_csv_btn.configure(state="disabled")
+        self.set_busy(True, "Procesando…")
 
         def progress_cb(msg: str):
-            # Actualiza la UI desde el hilo principal
             self.root.after(0, lambda: self.append_info(msg))
+
+        def month_span(s, e):
+            y, m = s.year, s.month
+            while (y < e.year) or (y == e.year and m <= e.month):
+                yield y, m
+                m += 1
+                if m > 12:
+                    m = 1
+                    y += 1
 
         def worker():
             try:
-                # Si el rango cruza meses, ejecuta por mes y combina (sin tocar el backend)
-                def month_span(y1, m1, y2, m2):
-                    y, m = y1, m1
-                    while (y < y2) or (y == y2 and m <= m2):
-                        yield y, m
-                        if m == 12:
-                            y, m = y + 1, 1
-                        else:
-                            m += 1
-
-                months = list(month_span(start_date.year, start_date.month, end_date_ui.year, end_date_ui.month))
-                monthly_dfs = []
-                all_details = []
+                months = list(month_span(sdate, edate))
+                monthly_dfs, all_details = [], []
                 total_files = total_processed = total_errors = 0
-                last_folder = str(Path(folder_path))
-                last_msgs = []
+                last_folder = folder_path
 
                 for (yy, mm) in months:
-                    # Tiempos por mes para no recortar días completos indebidamente
-                    if (yy, mm) == (start_date.year, start_date.month) and (yy, mm) == (end_date_ui.year, end_date_ui.month):
-                        s_t, e_t = start_time, end_time
-                    elif (yy, mm) == (start_date.year, start_date.month):
-                        s_t, e_t = start_time, "23:59"
-                    elif (yy, mm) == (end_date_ui.year, end_date_ui.month):
-                        s_t, e_t = "00:00", end_time
+                    # Límites de hora por mes iterado
+                    if (yy, mm) == (sdate.year, sdate.month) and (yy, mm) == (edate.year, edate.month):
+                        s_t = f"{sh:02d}:{sm:02d}"
+                        e_t = f"{eh:02d}:{em:02d}"
+                    elif (yy, mm) == (sdate.year, sdate.month):
+                        s_t, e_t = f"{sh:02d}:{sm:02d}", "23:59"
+                    elif (yy, mm) == (edate.year, edate.month):
+                        s_t, e_t = "00:00", f"{eh:02d}:{em:02d}"
                     else:
                         s_t, e_t = "00:00", "23:59"
 
-                    ok, msg, results = self.csv_processor.analyze_folder(
-                         Path(folder_path),
-                         mes_usuario=mm,
-                         año_usuario=yy,
-                         start_time=s_t,
-                         end_time=e_t,
-                         progress_cb=progress_cb
-                     )
-                    last_msgs.append(msg)
-                    if ok and hasattr(self.csv_processor, "combined_df") and self.csv_processor.combined_df is not None:
+                    if file_type == "csv":
+                        ok, msg, results = self.csv_processor.analyze_folder(
+                            Path(folder_path), mes_usuario=mm, año_usuario=yy,
+                            start_time=s_t, end_time=e_t, progress_cb=progress_cb
+                        )
+                    else:
+                        if hasattr(self.csv_processor, "analyze_folder_prn"):
+                            ok, msg, results = self.csv_processor.analyze_folder_prn(
+                                Path(folder_path), mes_usuario=mm, año_usuario=yy,
+                                start_time=s_t, end_time=e_t, progress_cb=progress_cb
+                            )
+                        else:
+                            ok, msg, results = False, "Función PRN no disponible", None
+
+                    if ok and getattr(self.csv_processor, "combined_df", None) is not None:
                         monthly_dfs.append(self.csv_processor.combined_df.copy())
                         all_details.extend(results.get("file_details", []))
                         total_files += results.get("total_files", 0)
                         total_processed += results.get("processed_files", 0)
                         total_errors += results.get("error_files", 0)
                         last_folder = results.get("folder", last_folder)
-                    else:
-                        total_files += results.get("total_files", 0) if results else 0
-                        total_errors += 1
 
                 if not monthly_dfs:
-                    self.root.after(0, lambda: self.show_error("No se generaron datos"))
+                    self.root.after(0, lambda: self.set_busy(False, "Sin datos"))
+                    self.root.after(0, lambda: self.append_info("No se generaron datos"))
                     return
 
                 combined = pd.concat(monthly_dfs, ignore_index=True)
-                combined = combined[(combined["timestamp"] >= user_start_dt) & (combined["timestamp"] <= user_end_dt)]
-                combined = combined.sort_values(["company", "timestamp"]).reset_index(drop=True)
+
+                # Normalizar timestamp si no es datetime
+                if "timestamp" in combined.columns and not pd.api.types.is_datetime64_any_dtype(combined["timestamp"]):
+                    # Intentos múltiples de parseo
+                    combined["timestamp"] = pd.to_datetime(
+                        combined["timestamp"].astype(str).str.strip(),
+                        errors="coerce", dayfirst=True
+                    )
+                # Eliminar filas sin timestamp válido
+                if "timestamp" in combined.columns:
+                    before_rows = combined.shape[0]
+                    combined = combined[pd.notna(combined["timestamp"])].copy()
+                    after_parse_rows = combined.shape[0]
+                else:
+                    before_rows = combined.shape[0]
+                    after_parse_rows = before_rows
+
+                # Filtro por rango final
+                if "timestamp" in combined.columns:
+                    combined = combined[(combined["timestamp"] >= start_dt) & (combined["timestamp"] <= end_dt)]
+                after_filter_rows = combined.shape[0]
+
+                if resolution == "1h" and not combined.empty and "timestamp" in combined.columns:
+                    combined["hour_ts"] = combined["timestamp"].dt.floor("H")
+                    agg_cols = {c: "sum" for c in ["kwh", "kvarh"] if c in combined.columns}
+                    grouped = combined.groupby(["company", "hour_ts"], as_index=False).agg(agg_cols)
+                    combined = grouped.rename(columns={"hour_ts": "timestamp"})
+                    combined = combined.sort_values(["company", "timestamp"]).reset_index(drop=True)
+
                 self.csv_processor.combined_df = combined
 
-                # ---- Deduplicar detalles por archivo (evita listar dos veces por mes) ----
-                fmt = "%d/%m/%Y %H:%M"
+                # Agregados y detalles
+                fmt = "%d/%m/%y %H:%M"
                 agg = defaultdict(lambda: {
                     "filename": None, "rows": 0, "success": False,
                     "kwh_values": 0, "kvar_values": 0,
@@ -232,27 +418,11 @@ class CSVUploaderApp:
                     a["success"] = a["success"] or bool(d.get("success", False))
                     a["kwh_values"] += int(d.get("kwh_values", 0))
                     a["kvar_values"] += int(d.get("kvar_values", 0))
-                    # tomar mínimo inicio y máximo fin disponibles
-                    try:
-                        sd = datetime.strptime(str(d.get("start_date")), fmt) if d.get("start_date") else None
-                        ed = datetime.strptime(str(d.get("end_date")), fmt) if d.get("end_date") else None
-                    except Exception:
-                        sd = ed = None
-                    if sd:
-                        if a["start_date"] is None or sd < datetime.strptime(a["start_date"], fmt):
-                            a["start_date"] = sd.strftime(fmt)
-                    if ed:
-                        if a["end_date"] is None or ed > datetime.strptime(a["end_date"], fmt):
-                            a["end_date"] = ed.strftime(fmt)
-                    if d.get("error"):
-                        a["error"] = (a["error"] + " | " if a["error"] else "") + str(d["error"])
                 dedup_details = list(agg.values())
-                # Ajustar rango mostrado por archivo al rango exacto del usuario si aplica
                 for a in dedup_details:
-                    a["start_date"] = user_start_dt.strftime(fmt) if a["start_date"] else user_start_dt.strftime(fmt)
-                    a["end_date"] = user_end_dt.strftime(fmt) if a["end_date"] else user_end_dt.strftime(fmt)
+                    a["start_date"] = start_dt.strftime(fmt)
+                    a["end_date"] = end_dt.strftime(fmt)
 
-                # Totales únicos por archivo
                 total_files_u = len(dedup_details)
                 processed_u = sum(1 for x in dedup_details if x.get("success"))
                 error_u = total_files_u - processed_u
@@ -263,21 +433,27 @@ class CSVUploaderApp:
                     "processed_files": processed_u,
                     "error_files": error_u,
                     "date_range": {
-                        "start": user_start_dt.strftime("%d/%m/%Y %H:%M"),
-                        "end": user_end_dt.strftime("%d/%m/%Y %H:%M"),
+                        "start": start_dt.strftime("%d/%m/%y %H:%M"),
+                        "end": end_dt.strftime("%d/%m/%y %H:%M")
                     },
                     "combined_stats": {
                         "total_rows": int(combined.shape[0]),
                         "total_columns": int(combined.shape[1]),
-                        "total_kwh_values": int(pd.notna(combined["kwh"]).sum()),
-                        "total_kvar_values": int(pd.notna(combined["kvarh"]).sum()),
+                        "total_kwh_values": int(pd.notna(combined["kwh"]).sum()) if "kwh" in combined.columns else 0,
+                        "total_kvar_values": int(pd.notna(combined["kvarh"]).sum()) if "kvarh" in combined.columns else 0,
+                        "resolution": resolution,
+                        "rows_before_parse": before_rows,
+                        "rows_after_parse": after_parse_rows,
+                        "rows_after_filter": after_filter_rows
                     },
                     "file_details": dedup_details,
-                    "errors": []  # ya contabilizados
+                    "errors": []
                 }
-                self.root.after(0, lambda: self.on_analysis_done(True, "Procesamiento completado", results_agg))
+                self.root.after(0, lambda: self.on_analysis_done(True, f"Procesamiento {file_type.upper()} completado", results_agg))
             except Exception as e:
                 self.root.after(0, lambda: self.show_error(str(e)))
+            finally:
+                self.root.after(0, lambda: self.set_busy(False, "Listo"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -287,65 +463,138 @@ class CSVUploaderApp:
         self.info_text.see(tk.END)
         self.info_text.configure(state="disabled")
 
-    def show_error(self, error_msg):
+    def clear_results(self):
+        """Limpia panel de información y deshabilita exportaciones."""
         self.info_text.configure(state="normal")
-        self.info_text.insert(tk.END, f"Error: {error_msg}\n")
+        self.info_text.delete("1.0", "end")
         self.info_text.configure(state="disabled")
-        messagebox.showerror("Error", error_msg)
+        self.export_excel_btn.configure(state="disabled")
+        self.export_csv_btn.configure(state="disabled")
+        self.append_info("Panel limpiado.")
+        self.last_results = None
+        self.csv_processor.combined_df = None
 
-    def on_analysis_done(self, ok, msg, results):
-        if ok and results and results.get("combined_stats", {}).get("total_rows", 0) > 0:
-            self.show_processing_info(results)
-            self.export_excel_btn.configure(state="normal")
-            self.export_csv_btn.configure(state="normal")
-            messagebox.showinfo("Éxito", msg)
+    def on_analysis_done(self, ok: bool, msg: str, results: dict):
+        self.append_info(msg)
+        if ok and getattr(self.csv_processor, "combined_df", None) is not None:
+            self.last_results = results
+            if hasattr(self, "export_excel_btn"):
+                self.export_excel_btn.configure(state="normal")
+            if hasattr(self, "export_csv_btn"):
+                self.export_csv_btn.configure(state="normal")
+            cs = results.get("combined_stats", {})
+            self.append_info(f"Filas: {cs.get('total_rows', 0)}  Columnas: {cs.get('total_columns', 0)}  Resolución: {cs.get('resolution', '')}")
         else:
-            self.show_error(msg)
+            self.append_info("Sin resultados para exportar.")
 
-    def show_processing_info(self, results):
-        self.info_text.configure(state="normal")
-        self.info_text.delete(1.0, tk.END)
-        info = []
-        info.append(f"Carpeta: {results['folder']}")
-        info.append(f"Archivos encontrados: {results['total_files']}")
-        info.append(f"Procesados: {results['processed_files']} | Con error: {results['error_files']}")
-        info.append(f"Rango de fechas: {results['date_range']['start']} → {results['date_range']['end']}")
-        info.append(f"Filas combinadas: {results['combined_stats']['total_rows']}")
-        info.append("")
-        info.append("Archivos:")
-        for f in results['file_details']:
-            if f.get('success'):
-                info.append(f"  ✓ {f['filename']} - {f['rows']} filas ({f['start_date']} → {f['end_date']})")
-            else:
-                info.append(f"  ✗ {f['filename']} - {f.get('error','Error')}")
-        self.info_text.insert(1.0, "\n".join(info))
-        self.info_text.configure(state="disabled")
+    def show_error(self, msg: str):
+        self.append_info(f"[ERROR] {msg}")
+        try:
+            messagebox.showerror("Error", msg)
+        except Exception:
+            pass
 
     def export_excel(self):
-        # Corrección de verificación
-        if not hasattr(self.csv_processor, 'combined_df') or self.csv_processor.combined_df is None:
-            messagebox.showwarning("Advertencia", "Primero analiza una carpeta")
+        df = getattr(self.csv_processor, "combined_df", None)
+        if df is None or df.empty:
+            messagebox.showinfo("Exportar", "No hay datos para exportar.")
             return
-        filename = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")])
-        if filename:
-            ok, msg = self.csv_processor.export_excel_multi_sheet(filename)
-            if ok:
-                messagebox.showinfo("Éxito", msg)
-            else:
-                messagebox.showerror("Error", msg)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx")],
+            title="Guardar como Excel"
+        )
+        if not path:
+            return
+
+        def sanitize_sheet_name(name: str, used: set) -> str:
+            base = re.sub(r'[\\/*?:\[\]]', "_", str(name)) or "Hoja"
+            base = base[:31]
+            # Evitar nombres reservados como 'History' en algunos builds
+            if base.strip().lower() in {"history"}:
+                base = f"_{base}"
+            candidate = base
+            i = 1
+            while candidate in used or len(candidate) == 0:
+                suffix = f"_{i}"
+                candidate = (base[: max(0, 31 - len(suffix))] + suffix) or f"Hoja_{i}"
+                i += 1
+            used.add(candidate)
+            return candidate
+
+        def apply_datetime_format(writer, sheet_name: str, df_sheet: pd.DataFrame):
+            """Aplica formato dd/mm/yy hh:mm a columnas datetime."""
+            try:
+                ws = writer.sheets[sheet_name]
+                from openpyxl.styles import numbers  # noqa: F401
+                for j, col in enumerate(df_sheet.columns, start=1):
+                    if pd.api.types.is_datetime64_any_dtype(df_sheet[col]):
+                        for col_cells in ws.iter_cols(min_col=j, max_col=j, min_row=2, max_row=ws.max_row):
+                            for cell in col_cells:
+                                cell.number_format = "dd/mm/yy hh:mm"
+            except Exception:
+                # Si openpyxl no está, simplemente no se aplica formato
+                pass
+
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                used_names = set()
+                # 1) Hoja por empresa
+                if "company" in df.columns:
+                    for comp, grp in df.groupby(df["company"].astype(str), dropna=True):
+                        sheet = sanitize_sheet_name(f"{comp}", used_names)
+                        grp.to_excel(writer, index=False, sheet_name=sheet)
+                        apply_datetime_format(writer, sheet, grp)
+                    # 2) Resumen
+                    resumen_cols = [c for c in ["kwh", "kvarh"] if c in df.columns]
+                    if resumen_cols:
+                        resumen = df.groupby(df["company"].astype(str), as_index=False)[resumen_cols].sum()
+                    else:
+                        resumen = df.groupby(df["company"].astype(str), as_index=False).size().rename(columns={"size": "rows"})
+                    resumen_sheet = sanitize_sheet_name("Resumen", used_names)
+                    resumen.to_excel(writer, index=False, sheet_name=resumen_sheet)
+                # 3) Combinado
+                comb_sheet = sanitize_sheet_name("Combinado", used_names)
+                df.to_excel(writer, index=False, sheet_name=comb_sheet)
+                apply_datetime_format(writer, comb_sheet, df)
+                # 4) Detalles
+                details = None
+                if hasattr(self, "last_results") and isinstance(self.last_results, dict):
+                    details = self.last_results.get("file_details")
+                if details:
+                    try:
+                        det_df = pd.DataFrame(details)
+                        det_sheet = sanitize_sheet_name("Detalles", used_names)
+                        det_df.to_excel(writer, index=False, sheet_name=det_sheet)
+                    except Exception:
+                        pass
+            messagebox.showinfo("Exportar", f"Archivo guardado:\n{path}")
+        except Exception as e:
+            self.show_error(str(e))
 
     def export_csv(self):
-        # Corrección de verificación
-        if not hasattr(self.csv_processor, 'combined_df') or self.csv_processor.combined_df is None:
-            messagebox.showwarning("Advertencia", "Primero analiza una carpeta")
+        df = getattr(self.csv_processor, "combined_df", None)
+        if df is None or df.empty:
+            messagebox.showinfo("Exportar", "No hay datos para exportar.")
             return
-        filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if filename:
-            ok, msg = self.csv_processor.export_combined_csv(filename)
-            if ok:
-                messagebox.showinfo("Éxito", msg)
-            else:
-                messagebox.showerror("Error", msg)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+            title="Guardar como CSV"
+        )
+        if not path:
+            return
+        try:
+            out = df.copy()
+            if "timestamp" in out.columns and pd.api.types.is_datetime64_any_dtype(out["timestamp"]):
+                out["timestamp"] = out["timestamp"].dt.strftime("%d/%m/%y %H:%M")
+            # Si existen otras columnas datetime y quieres formatearlas también:
+            # for c in out.select_dtypes(include=["datetime64[ns]"]).columns:
+            #     out[c] = out[c].dt.strftime("%d/%m/%y %H:%M")
+            out.to_csv(path, index=False, encoding="utf-8-sig")
+            messagebox.showinfo("Exportar", f"Archivo guardado:\n{path}")
+        except Exception as e:
+            self.show_error(str(e))
 
     def clear_data(self):
         self.folder_path.delete(0, 'end')

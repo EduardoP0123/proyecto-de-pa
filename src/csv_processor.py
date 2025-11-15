@@ -4,26 +4,79 @@ CSV processor para archivos KV2C - VERSIÓN ARREGLADA
 - Detección robusta de columnas kWh/kvarh
 - Mantiene TODOS los valores válidos
 """
-import re
+from pathlib import Path
+from typing import Optional, Tuple, List
 import logging
 import pandas as pd
-from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple, List
-from .utils import parse_datetime_series, normalize_am_pm
+import re
 
-# Configuración de logging del módulo (idempotente)
+
+# Logger simple (si ya tienes otro, puedes reemplazarlo)
 LOG = logging.getLogger("csv_processor")
 if not LOG.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    LOG.addHandler(_h)
-    LOG.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    LOG.addHandler(handler)
+LOG.setLevel(logging.INFO)
+
+
+# Stubs utilitarios para evitar NameError (ajusta si ya existen en otro módulo)
+def normalize_am_pm(value: str) -> str:
+    """
+    Recibe un solo valor (string) de hora o fecha+hora y si contiene AM/PM lo convierte a 24h.
+    Devuelve el valor original si no se puede convertir.
+    Acepta variantes como:
+      10/31/2025 12:15 AM
+      10/31/2025 1:05 PM
+      12:30 AM
+    """
+    if value is None:
+        return value
+    txt = str(value).strip()
+    if not txt:
+        return txt
+    upper = txt.upper()
+    # Casos que ya están en 24h (contienen HH:MM y no AM/PM)
+    if ("AM" not in upper and "PM" not in upper):
+        return txt
+    try:
+        # Primero solo hora AM/PM
+        dt = datetime.strptime(upper, "%I:%M %p")
+        return dt.strftime("%H:%M")
+    except Exception:
+        pass
+    # Intentar fecha + hora
+    for fmt in ("%m/%d/%Y %I:%M %p", "%d/%m/%Y %I:%M %p"):
+        try:
+            dt = datetime.strptime(upper, fmt)
+            # Devuelve misma fecha + hora 24h
+            return dt.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            continue
+    return txt
+
+
+def parse_datetime_series(date_series: pd.Series,
+                          time_series: Optional[pd.Series] = None,
+                          dayfirst: bool = True) -> pd.Series:
+    """
+    Combina series de fecha y hora en timestamp.
+    Retorna NaT donde no fue posible.
+    """
+    if time_series is not None:
+        combo = date_series.astype(str).str.strip() + " " + time_series.astype(str).str.strip()
+    else:
+        combo = date_series.astype(str).str.strip()
+    ts = pd.to_datetime(combo, errors="coerce", dayfirst=dayfirst)
+    return ts
+
 
 class CSVProcessor:
     def __init__(self, workspace: Path = None):
         self.workspace = workspace
-        self.combined_df: Optional[pd.DataFrame] = None
+        self.combined_df = None
 
     # ---------------- HEADER KV2C CORRECTO (evitar Scale Factor) ----------------
     def _find_kv2c_header_index(self, lines: list[int | str]) -> int:
@@ -454,7 +507,7 @@ class CSVProcessor:
                     continue
 
                 # Parseo local para poder agrupar; no toca tu UI
-                date_series = df[date_col].astype(str).map(normalize_am_pm)
+                date_series = df[date_col].astype(str).apply(normalize_am_pm)
                 ts = parse_datetime_series(date_series)
                 df = df.copy()
                 df["__ts__"] = ts
@@ -533,3 +586,93 @@ class CSVProcessor:
             "errors": errors
         }
         return True, f"Procesamiento completado: {len(processed)} archivos procesados", results
+
+    def load_prn(self, path: Path) -> pd.DataFrame:
+        """
+        Intenta leer un archivo PRN (generalmente separado por espacios o tabulaciones).
+        Se limpia encabezado y normaliza nombres.
+        """
+        try:
+            df = pd.read_csv(path, sep=None, engine="python", header=0)
+        except Exception:
+            # Fallback a whitespace
+            df = pd.read_csv(path, delim_whitespace=True, header=0)
+        df.columns = [c.strip().lower() for c in df.columns]
+        # Normalizar columnas esperadas si existen
+        for maybe in ["fecha", "date"]:
+            if maybe in df.columns and "timestamp" not in df.columns:
+                # Intento parsear fecha y hora si hay columna hora
+                if "hora" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df[maybe] + " " + df["hora"], errors="coerce", dayfirst=True)
+                else:
+                    df["timestamp"] = pd.to_datetime(df[maybe], errors="coerce", dayfirst=True)
+        if "timestamp" not in df.columns:
+            # Busca combinaciones
+            for f_col in ["date", "fecha"]:
+                for h_col in ["time", "hora"]:
+                    if f_col in df.columns and h_col in df.columns:
+                        df["timestamp"] = pd.to_datetime(df[f_col] + " " + df[h_col], errors="coerce", dayfirst=True)
+        df = df.dropna(subset=["timestamp"])
+        df = df.sort_values("timestamp")
+        df.reset_index(drop=True, inplace=True)
+        return df
+
+    def analyze_folder_prn(self, folder: Path, mes_usuario: int, año_usuario: int,
+                           start_time: str, end_time: str, progress_cb=None):
+        """
+        Similar a analyze_folder para CSV pero filtrando archivos .prn
+        (Reutiliza atributos combined_df y exportaciones).
+        """
+        prn_files = list(folder.glob("*.prn"))
+        details = []
+        total_ok = 0
+        for f in prn_files:
+            try:
+                df = self.load_prn(f)
+                # Filtro por mes/año y rango de hora dentro del mes
+                df = df[(df["timestamp"].dt.year == año_usuario) & (df["timestamp"].dt.month == mes_usuario)]
+                if not df.empty:
+                    h_start = datetime.strptime(start_time, "%H:%M").time()
+                    h_end   = datetime.strptime(end_time, "%H:%M").time()
+                    df = df[(df["timestamp"].dt.time >= h_start) & (df["timestamp"].dt.time <= h_end)]
+                if df.empty:
+                    details.append({"filename": f.name, "rows": 0, "success": True,
+                                    "kwh_values": 0, "kvar_values": 0})
+                    continue
+                # Intentar detectar columnas de energía
+                kwh_col = next((c for c in df.columns if "kwh" in c), None)
+                kvar_col = next((c for c in df.columns if "kvar" in c), None)
+                if kwh_col and "kwh" not in df.columns:
+                    df["kwh"] = pd.to_numeric(df[kwh_col], errors="coerce")
+                if kvar_col and "kvarh" not in df.columns:
+                    df["kvarh"] = pd.to_numeric(df[kvar_col], errors="coerce")
+
+                df["company"] = f.stem  # etiqueta simple
+                self.combined_df = df if self.combined_df is None else pd.concat([self.combined_df, df], ignore_index=True)
+                details.append({
+                    "filename": f.name,
+                    "rows": int(df.shape[0]),
+                    "success": True,
+                    "kwh_values": int(df["kwh"].notna().sum()) if "kwh" in df.columns else 0,
+                    "kvar_values": int(df["kvarh"].notna().sum()) if "kvarh" in df.columns else 0
+                })
+                total_ok += 1
+                if progress_cb:
+                    progress_cb(f"PRN procesado: {f.name} ({df.shape[0]} filas)")
+            except Exception as e:
+                details.append({"filename": f.name, "rows": 0, "success": False, "error": str(e),
+                                "kwh_values": 0, "kvar_values": 0})
+                if progress_cb:
+                    progress_cb(f"Error PRN: {f.name} - {e}")
+
+        if self.combined_df is not None:
+            self.combined_df.sort_values(["company", "timestamp"], inplace=True)
+            self.combined_df.reset_index(drop=True, inplace=True)
+
+        return True, "PRN analizado", {
+            "folder": str(folder),
+            "total_files": len(prn_files),
+            "processed_files": total_ok,
+            "error_files": len(prn_files) - total_ok,
+            "file_details": details
+        }
