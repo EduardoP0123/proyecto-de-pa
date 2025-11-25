@@ -44,16 +44,16 @@ jobs:
         shell: powershell
         run: |
           $addData = @()
-          if (Test-Path "ui\images") { $addData += "--add-data \"ui\\images;ui\\images\"" }
-          if (Test-Path "config") { $addData += "--add-data \"config;config\"" }
+          if (Test-Path 'ui\images') { $addData += @('--add-data','ui\images;ui\images') }
+          if (Test-Path 'config') { $addData += @('--add-data','config;config') }
           $args = @(
-            "-m", "PyInstaller",
-            "--noconfirm", "--clean",
-            "--windowed", "--onefile",
-            "--name", "$env:SAFE_NAME",
-            "--hidden-import", "tkcalendar",
-            "--hidden-import", "openpyxl"
-          ) + $addData + @("run_app.py")
+            '-m','PyInstaller',
+            '--noconfirm','--clean',
+            '--windowed','--onefile',
+            '--name', "$env:SAFE_NAME",
+            '--hidden-import','tkcalendar',
+            '--hidden-import','openpyxl'
+          ) + $addData + @('run_app.py')
           & python $args
 
       - name: Zip exe
