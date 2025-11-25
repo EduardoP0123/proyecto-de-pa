@@ -1,6 +1,9 @@
 name: Release (Windows + macOS)
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       version_tag:
@@ -141,18 +144,12 @@ jobs:
           echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
           echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
 
-        - name: Publish GitHub Release (create + upload assets)
-          uses: softprops/action-gh-release@v2
-          env:
-            GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          with:
-            tag_name: ${{ github.event.inputs.version_tag }}
-            name: ${{ github.event.inputs.version_tag }} - ${{ github.event.inputs.app_name }}
-            draft: false
-            prerelease: false
-            files: |
-              release/windows/${{ env.SAFE_NAME }}-windows.zip
-              release/macos/${{ env.SAFE_NAME }}-mac.zip
+      - name: Determine tag
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.version_tag }}"
+          if [ -z "$TAG" ]; then TAG="$GITHUB_REF_NAME"; fi
+          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
@@ -165,5 +162,17 @@ jobs:
         with:
           name: ${{ env.SAFE_NAME }}-mac
           path: release/macos
+
+      - name: Publish GitHub Release (create + upload assets)
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.TAG_NAME }} - ${{ env.APP_NAME }}
+          draft: false
+          prerelease: false
+          files: |
+            release/windows/${{ env.SAFE_NAME }}-windows.zip
+            release/macos/${{ env.SAFE_NAME }}-mac.zip
 
 
