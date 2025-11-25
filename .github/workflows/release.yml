@@ -15,6 +15,10 @@ on:
         default: "KV2C & KV2A ANALYZER v 2.0"
 
 jobs:
+  # Ensure the workflow has permission to write releases
+  # Requires repo Settings → Actions → General → Read and write permissions
+  permissions:
+    contents: write
   build-windows:
     runs-on: windows-latest
     steps:
