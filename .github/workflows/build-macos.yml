@@ -1,0 +1,60 @@
+name: Build macOS app (PyInstaller)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App bundle name (e.g., KV2C & KV2A ANALYZER v 2.0)"
+        required: false
+        default: "KV2C_KV2A_ANALYZER_v2.0"
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compute names
+        shell: bash
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          if [ -z "$APP_NAME" ]; then APP_NAME="KV2C_KV2A_ANALYZER_v2.0"; fi
+          SAFE_NAME=$(echo "$APP_NAME" | tr -c 'A-Za-z0-9._-' '_')
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build app with PyInstaller
+        run: |
+          python -m PyInstaller \
+            --noconfirm --clean \
+            --windowed \
+            --name "$SAFE_NAME" \
+            --hidden-import tkcalendar \
+            --hidden-import openpyxl \
+            --add-data "ui/images:ui/images" \
+            --add-data "assets:assets" \
+            --add-data "config:config" \
+            run_app.py
+
+      - name: Zip .app bundle
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "$SAFE_NAME.app" "$SAFE_NAME-mac.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}-mac
+          path: dist/${{ env.SAFE_NAME }}-mac.zip
