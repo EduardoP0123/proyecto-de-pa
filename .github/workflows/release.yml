@@ -18,6 +18,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Remove stale PyInstaller spec files
+        shell: bash
+        run: |
+          find . -name "*.spec" -delete || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -70,6 +75,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Remove stale PyInstaller spec files
+        shell: bash
+        run: |
+          find . -name "*.spec" -delete || true
 
       - name: Set up Python
         uses: actions/setup-python@v5

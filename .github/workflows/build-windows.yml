@@ -15,6 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Remove stale PyInstaller spec files
+        shell: powershell
+        run: |
+          Get-ChildItem -Recurse -Filter "*.spec" | Remove-Item -Force -ErrorAction SilentlyContinue
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
