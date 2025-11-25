@@ -141,16 +141,18 @@ jobs:
           echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
           echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
 
-      - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.event.inputs.version_tag }}
-          release_name: ${{ github.event.inputs.version_tag }} - ${{ github.event.inputs.app_name }}
-          draft: false
-          prerelease: false
+        - name: Publish GitHub Release (create + upload assets)
+          uses: softprops/action-gh-release@v2
+          env:
+            GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          with:
+            tag_name: ${{ github.event.inputs.version_tag }}
+            name: ${{ github.event.inputs.version_tag }} - ${{ github.event.inputs.app_name }}
+            draft: false
+            prerelease: false
+            files: |
+              release/windows/${{ env.SAFE_NAME }}-windows.zip
+              release/macos/${{ env.SAFE_NAME }}-mac.zip
 
       - name: Download Windows artifact
         uses: actions/download-artifact@v4
@@ -164,22 +166,4 @@ jobs:
           name: ${{ env.SAFE_NAME }}-mac
           path: release/macos
 
-      - name: Upload asset (Windows zip)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/windows/${{ env.SAFE_NAME }}-windows.zip
-          asset_name: ${{ env.SAFE_NAME }}-windows.zip
-          asset_content_type: application/zip
 
-      - name: Upload asset (macOS zip)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: release/macos/${{ env.SAFE_NAME }}-mac.zip
-          asset_name: ${{ env.SAFE_NAME }}-mac.zip
-          asset_content_type: application/zip
