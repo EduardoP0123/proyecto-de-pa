@@ -41,15 +41,18 @@ jobs:
       - name: Build exe with PyInstaller
         shell: powershell
         run: |
-          python -m PyInstaller `
-            --noconfirm --clean `
-            --windowed --onefile `
-            --name "$env:SAFE_NAME" `
-            --hidden-import tkcalendar `
-            --hidden-import openpyxl `
-            --add-data "ui\images;ui\images" `
-            --add-data "config;config" `
-            run_app.py
+          $addData = @()
+          if (Test-Path "ui\images") { $addData += "--add-data \"ui\\images;ui\\images\"" }
+          if (Test-Path "config") { $addData += "--add-data \"config;config\"" }
+          $args = @(
+            "-m", "PyInstaller",
+            "--noconfirm", "--clean",
+            "--windowed", "--onefile",
+            "--name", "$env:SAFE_NAME",
+            "--hidden-import", "tkcalendar",
+            "--hidden-import", "openpyxl"
+          ) + $addData + @("run_app.py")
+          & python $args
 
       - name: Zip exe
         shell: powershell
@@ -91,14 +94,16 @@ jobs:
       - name: Build app with PyInstaller (.app bundle)
         shell: bash
         run: |
+          ADD_DATA_ARGS=""
+          if [ -d "ui/images" ]; then ADD_DATA_ARGS="$ADD_DATA_ARGS --add-data ui/images:ui/images"; fi
+          if [ -d "config" ]; then ADD_DATA_ARGS="$ADD_DATA_ARGS --add-data config:config"; fi
           pyinstaller \
             --noconfirm --clean \
             --windowed \
             --name "$SAFE_NAME" \
             --hidden-import tkcalendar \
             --hidden-import openpyxl \
-            --add-data "ui/images:ui/images" \
-            --add-data "config:config" \
+            $ADD_DATA_ARGS \
             run_app.py
 
       - name: Zip .app
