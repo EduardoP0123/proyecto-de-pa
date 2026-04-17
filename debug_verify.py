@@ -1,8 +1,7 @@
 """
 UI Form
-- Formateo a 3 decimales idéntico al requerimiento de la imagen (#,##0.000).
-- Fórmula matemática KW restaurada a =MAX() * factor_demanda * multiplo.
-- Cabecera en color Cyan y columna KW en color Amarillo.
+- Formateo a 3 decimales idéntico al requerimiento de la imagen.
+- Fórmula matemática KW restaurada a =MAX() * factor_demanda * multiplo
 """
 import os
 import sys
@@ -558,8 +557,8 @@ class CSVUploaderApp:
                 rows.append({
                     "Fecha": format_es_date(cur.date()),
                     "Hora": h + 1,
-                    "Kwh": round(kwh_scaled, 3),
-                    "Kvarh": round(kvarh_scaled, 3),
+                    "Kwh": round(kwh_scaled, 3), # Usar 3 decimales
+                    "Kvarh": round(kvarh_scaled, 3), # Usar 3 decimales
                 })
             cur += timedelta(days=1)
         report = pd.DataFrame(rows, columns=["Fecha", "Hora", "Kwh", "Kvarh"])
@@ -719,8 +718,8 @@ class CSVUploaderApp:
 
             wb = Workbook()
             
-            cyan_fill = PatternFill("solid", fgColor="00FFFF")
-            yellow_fill = PatternFill("solid", fgColor="FFFF00")
+            # Estilos sin fondo amarillo estridente (para coincidir con imagen 2 que es minimalista)
+            cyan_fill = PatternFill("solid", fgColor="D9EAF7") # Cabecera suave
             light_fill = PatternFill("solid", fgColor="E9F5FE") 
             thin = Side(style="thin", color="000000")
             border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -758,6 +757,7 @@ class CSVUploaderApp:
             sheet_by_company = {}
             total_rows = []
             
+            # CORRECCIÓN: Se restaura el cálculo estándar de demanda (factor de multiplicación 4 para resoluciones de 15 minutos)
             factor_demanda = 1 if self.resolution.get() == "1h" else 4
 
             for idx, company in enumerate(companies, start=1):
@@ -827,6 +827,7 @@ class CSVUploaderApp:
                 last_row = start_row + max(len(cdf), 1) - 1
                 esc = sheet_name.replace("'", "''")
                 
+                # CORRECCIÓN: La fórmula de Excel vuelve a ser =MAX(Rango) * Factor_Demanda * Múltiplo
                 if len(cdf) <= 0:
                     kw_formula = 0
                 else:
@@ -857,9 +858,7 @@ class CSVUploaderApp:
                     c6.value = kw_formula
                 else:
                     c6.value = 0
-                c6.number_format = "#,##0.000"
-                c6.fill = yellow_fill
-                c6.font = Font(bold=True)
+                c6.number_format = "#,##0.000" # Restaurado a 3 decimales
                 
                 for col_idx in range(1, 7):
                     ws_total.cell(row=r_idx, column=col_idx).border = border
