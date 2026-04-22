@@ -121,6 +121,31 @@ class CSVProcessor:
     def __init__(self, workspace: Path = None):
         self.workspace = workspace
         self.combined_df = None
+        self._last_file_metadata = {}
+
+    def _extract_meter_metadata(self, lines: list, hdr_idx: int) -> dict:
+        metadata = {"meter_id": None, "scale_factor": 1.0}
+        for line in lines[:hdr_idx]:
+            low = line.lower().strip()
+            if low.startswith("meter id") or low.startswith("meter_id"):
+                parts = re.split(r'[,\t]', line, maxsplit=1)
+                if len(parts) > 1:
+                    val = parts[1].strip().strip('"').strip()
+                    if val:
+                        metadata["meter_id"] = val
+                        break
+        if hdr_idx + 1 < len(lines):
+            subhdr = lines[hdr_idx + 1]
+            matches = re.findall(r'\((\d+(?:\.\d+)?)\)', subhdr)
+            for m_str in matches:
+                try:
+                    sf = float(m_str)
+                    if sf > 1:
+                        metadata["scale_factor"] = sf
+                        break
+                except Exception:
+                    pass
+        return metadata
 
     def _find_kv2c_header_index(self, lines: list[int | str]) -> int:
         best_idx, best_score = 0, -10_000
@@ -156,6 +181,10 @@ class CSVProcessor:
                     lines = f.readlines()
 
                 hdr_idx = self._find_kv2c_header_index(lines)
+
+                # Extract meter metadata before reading the DataFrame
+                metadata = self._extract_meter_metadata(lines, hdr_idx)
+                self._last_file_metadata = metadata
 
                 def _read_at(idx: int, engine: str | None = None) -> pd.DataFrame:
                     kwargs = dict(
@@ -406,12 +435,16 @@ class CSVProcessor:
         eh, em = map(int, end_time.split(":"))
         dias_mes = calendar.monthrange(año_usuario, mes_usuario)[1]
         start_dt = datetime(año_usuario, mes_usuario, 1, sh, sm, 0)
-        
+
         end_dt = datetime(año_usuario, mes_usuario, dias_mes, eh, em, 0)
         if eh == 23 and em == 59:
             end_dt = end_dt + pd.Timedelta(minutes=1)
 
-        full_range = pd.date_range(start_dt, end_dt, freq="15min")
+        # kV2C timestamps are end-of-interval: the 00:00 reading on day 1
+        # covers Jul 31 23:45–Aug 1 00:00 and belongs to the PREVIOUS month.
+        # First valid interval of the billing month starts at 00:15.
+        grid_start = start_dt + pd.Timedelta(minutes=15) if (sh == 0 and sm == 0) else start_dt
+        full_range = pd.date_range(grid_start, end_dt, freq="15min")
         expected_rows = len(full_range)
         LOG.info(f"Rejilla generada: {expected_rows} filas.")
         start_str = full_range.min().strftime("%d/%m/%Y %H:%M")
@@ -420,6 +453,7 @@ class CSVProcessor:
         processed = []
         details = []
         errors = []
+        scale_factors = {}
 
         report(f"Archivos detectados: {len(csv_files)}")
 
@@ -427,23 +461,38 @@ class CSVProcessor:
             report(f"[{i}/{len(csv_files)}] Procesando {csv_path.name}")
             try:
                 df = self.load_csv(csv_path)
+
+                # Resolve company name and scale factor from metadata
+                metadata = getattr(self, '_last_file_metadata', {})
+                raw_meter_id = metadata.get('meter_id')
+                if raw_meter_id:
+                    company_name = str(raw_meter_id).strip().strip('"').strip("'").strip()
+                else:
+                    company_name = csv_path.stem
+                scale_factor = metadata.get('scale_factor', 1.0)
+
                 date_col = self.detect_date_column(df)
                 if not date_col:
                     out = pd.DataFrame({
-                        "company": csv_path.stem,
+                        "company": company_name,
                         "timestamp": full_range,
                         "kwh": pd.NA,
                         "kvarh": pd.NA
                     })
                     processed.append(out)
-                    details.append({
+                    file_detail = {
                         "filename": csv_path.name,
                         "rows": len(out),
                         "success": True,
                         "note": "sin fecha",
                         "start_date": start_str,
                         "end_date": end_str
-                    })
+                    }
+                    if scale_factor > 1:
+                        file_detail["scale_factor"] = scale_factor
+                    details.append(file_detail)
+                    if scale_factor > 1:
+                        scale_factors[company_name] = scale_factor
                     continue
 
                 date_series = df[date_col].astype(str).apply(normalize_am_pm)
@@ -461,14 +510,14 @@ class CSVProcessor:
                 kvar_valid = energy["kvar_val"].notna().sum() if "kvar_val" in energy.columns else 0
                 if kwh_valid == 0 and kvar_valid == 0:
                     report(f"  ⚠ {csv_path.name}: 0 valores de energía detectados (revisar encabezados)")
-                
+
                 if "kwh_val" in energy.columns:
                     neg_count = (energy["kwh_val"].dropna() < 0).sum()
                     if neg_count > 0:
                         report(f"  ⚠ {csv_path.name}: {neg_count} valores kWh negativos encontrados")
                         energy.loc[energy["kwh_val"] < 0, "kwh_val"] = 0.0
-                        
-                    outlier_mask = energy["kwh_val"] > 1000 
+
+                    outlier_mask = energy["kwh_val"] > 1000
                     outlier_count = outlier_mask.sum()
                     if outlier_count > 0:
                         report(f"  ⚠ {csv_path.name}: {outlier_count} valores anómalos (>1000 kWh/15m) eliminados para proteger el cálculo de kW.")
@@ -479,7 +528,7 @@ class CSVProcessor:
                     if neg_count > 0:
                         report(f"  ⚠ {csv_path.name}: {neg_count} valores kVArh negativos encontrados")
                         energy.loc[energy["kvar_val"] < 0, "kvar_val"] = 0.0
-                
+
                 dup_ts = energy["__ts__"].duplicated().sum()
                 if dup_ts > 0:
                     report(f"  ⚠ {csv_path.name}: {dup_ts} timestamps duplicados (se conserva primero)")
@@ -487,7 +536,7 @@ class CSVProcessor:
 
                 in_month = energy[(energy["__ts__"] >= full_range.min()) &
                                   (energy["__ts__"] <= full_range.max())].copy()
-                                  
+
                 if not in_month.empty:
                     in_month = in_month.set_index("__ts__")
                     kwh_full = in_month["kwh_val"]
@@ -499,14 +548,14 @@ class CSVProcessor:
                     full_range_actual = []
 
                 final_df = pd.DataFrame({
-                    "company": csv_path.stem,
+                    "company": company_name,
                     "timestamp": full_range_actual,
                     "kwh": kwh_full.values,
                     "kvarh": kvar_full.values
                 })
 
                 processed.append(final_df)
-                details.append({
+                file_detail = {
                     "filename": csv_path.name,
                     "rows": len(final_df),
                     "success": True,
@@ -514,7 +563,11 @@ class CSVProcessor:
                     "kvar_values": int(pd.notna(final_df["kvarh"]).sum()),
                     "start_date": start_str,
                     "end_date": end_str
-                })
+                }
+                if scale_factor > 1:
+                    file_detail["scale_factor"] = scale_factor
+                    scale_factors[company_name] = scale_factor
+                details.append(file_detail)
 
             except Exception as e:
                 LOG.exception(f"Error procesando {csv_path.name}")
@@ -540,6 +593,7 @@ class CSVProcessor:
             "total_files": len(csv_files),
             "processed_files": len(processed),
             "error_files": len(errors),
+            "scale_factors": scale_factors,
             "date_range": {
                 "start": start_str,
                 "end": end_str,

@@ -6,6 +6,7 @@ UI Form
 """
 import os
 import sys
+import json
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -64,7 +65,7 @@ class CSVUploaderApp:
         self.create_widgets()
         self._build_statusbar()
 
-        self.company_multipliers = {}
+        self.company_multipliers = self._load_multipliers_config()
         self.last_report = None
 
     def _init_style(self):
@@ -86,6 +87,86 @@ class CSVUploaderApp:
         style.configure("Card.TFrame", padding=12)
         style.configure("Section.TLabelframe", padding=12)
         style.configure("Section.TLabelframe.Label", font=("Segoe UI", 11, "bold"))
+
+    def _multipliers_cfg_path(self) -> Path:
+        return Path.home() / "Downloads" / "BILLREAD_WORKSPACE" / "multipliers.json"
+
+    def _load_multipliers_config(self) -> dict:
+        p = self._multipliers_cfg_path()
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_multipliers_config(self):
+        p = self._multipliers_cfg_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(self.company_multipliers, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def show_multipliers_dialog(self):
+        df = getattr(self.csv_processor, "combined_df", None)
+        config_companies = list(self.company_multipliers.keys())
+        data_companies = (
+            sorted(str(x) for x in df["company"].dropna().unique())
+            if df is not None and not df.empty and "company" in df.columns
+            else []
+        )
+        companies = list(dict.fromkeys(data_companies + config_companies))
+        if not companies:
+            messagebox.showinfo("Configurar Multiplos", "Primero analiza una carpeta para cargar las empresas.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Configurar Multiplos por Empresa")
+        win.geometry("520x480")
+        win.resizable(True, True)
+        win.grab_set()
+
+        ttk.Label(win, text="Empresa", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 4))
+        ttk.Label(win, text="Multiplo", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=4, pady=(12, 4))
+
+        canvas = tk.Canvas(win, borderwidth=0)
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=12)
+        scrollbar.grid(row=1, column=2, sticky="ns")
+        win.rowconfigure(1, weight=1)
+        win.columnconfigure(0, weight=1)
+
+        entries = {}
+        for i, company in enumerate(companies):
+            ttk.Label(scroll_frame, text=str(company)[:45]).grid(row=i, column=0, sticky="w", pady=2, padx=4)
+            entry = ttk.Entry(scroll_frame, width=10)
+            current = self.company_multipliers.get(company, getattr(self, "default_multiplier", 80))
+            entry.insert(0, str(int(current)) if float(current) == int(float(current)) else str(current))
+            entry.grid(row=i, column=1, sticky="w", padx=(8, 0), pady=2)
+            entries[company] = entry
+
+        btn_frame = ttk.Frame(win, padding=(12, 8))
+        btn_frame.grid(row=2, column=0, columnspan=3, sticky="ew")
+
+        def _save_and_close():
+            for company, entry in entries.items():
+                try:
+                    self.company_multipliers[company] = float(entry.get())
+                except ValueError:
+                    pass
+            self._save_multipliers_config()
+            win.destroy()
+            messagebox.showinfo("Multiplos", "Multiplos guardados correctamente.")
+
+        ttk.Button(btn_frame, text="Guardar", style="Accent.TButton", command=_save_and_close).pack(side="right")
+        ttk.Button(btn_frame, text="Cancelar", command=win.destroy).pack(side="right", padx=(0, 8))
 
     def _load_seg_logo(self, max_h=56, max_w=220):
         try:
@@ -212,6 +293,8 @@ class CSVUploaderApp:
         self.clear_btn.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.report_btn = ttk.Button(btns, text="Generar reporte mensual", command=self.generate_report, state="disabled")
         self.report_btn.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self.mult_cfg_btn = ttk.Button(btns, text="Configurar Multiplos", command=self.show_multipliers_dialog)
+        self.mult_cfg_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         right = ttk.Labelframe(body, text="Registro y resultados", style="Section.TLabelframe")
         right.grid(row=0, column=1, sticky="nsew")
@@ -510,6 +593,7 @@ class CSVUploaderApp:
         except Exception:
             return
         self.company_multipliers[company] = m
+        self._save_multipliers_config()
 
     def _hourly_aggregate(self, df):
         if "timestamp" not in df.columns:
@@ -784,11 +868,8 @@ class CSVUploaderApp:
                     if name not in cols:
                         cols.append(name)
 
-                from openpyxl.utils import get_column_letter
                 kwh_col_idx = cols.index("kwh") + 1 if "kwh" in cols else None
                 kvar_col_idx = cols.index("kvarh") + 1 if "kvarh" in cols else None
-                kwh_letter = get_column_letter(kwh_col_idx) if kwh_col_idx else "C"
-                kvar_letter = get_column_letter(kvar_col_idx) if kvar_col_idx else "D"
 
                 ws["A1"] = "Multiplo →"; ws["A1"].font = Font(bold=True, size=12)
                 ws["B1"] = int(m)
@@ -824,18 +905,14 @@ class CSVUploaderApp:
                 ws.column_dimensions["C"].width = 16
                 ws.column_dimensions["D"].width = 16
 
-                last_row = start_row + max(len(cdf), 1) - 1
-                esc = sheet_name.replace("'", "''")
-                
-                if len(cdf) <= 0:
-                    kw_formula = 0
-                else:
-                    kw_formula = f"=MAX('{esc}'!${kwh_letter}${start_row}:${kwh_letter}${last_row})*{factor_demanda}*{m}"
-                
-                total_rows.append((idx, company, m, kwh_total, kvar_total, kw_formula, esc,
-                                   start_row, last_row, kwh_letter, kvar_letter))
+                # Pre-compute KW demand directly (MAX kWh per interval * factor * multiplo)
+                raw_kwh = pd.to_numeric(cdf["kwh"], errors="coerce") if "kwh" in cdf.columns else pd.Series(dtype="float64")
+                max_interval_kwh = float(raw_kwh.max()) if raw_kwh.notna().any() else 0.0
+                kw_value = max_interval_kwh * factor_demanda * m
 
-            for r_idx, (no, company, m, kwh_t, kvar_t, kw_formula, esc, srow, lrow, kl, vl) in enumerate(total_rows, start=2):
+                total_rows.append((idx, company, m, kwh_total, kvar_total, kw_value))
+
+            for r_idx, (no, company, m, kwh_t, kvar_t, kw_val) in enumerate(total_rows, start=2):
                 c1 = ws_total.cell(row=r_idx, column=1, value=no)
                 c_name = ws_total.cell(row=r_idx, column=2, value=company)
                 sheet_name = sheet_by_company[company]
@@ -843,24 +920,18 @@ class CSVUploaderApp:
                 c_name.hyperlink = f"#'{esc}'!A1"
                 c_name.font = Font(color="0563C1", underline="single")
                 c3 = ws_total.cell(row=r_idx, column=3, value=int(m))
-                
-                c4 = ws_total.cell(row=r_idx, column=4)
-                c4.value = f"=IF(ISNUMBER('{esc}'!${kl}$1), '{esc}'!${kl}$1, SUM('{esc}'!${kl}${srow}:${kl}${lrow})*$C{r_idx})"
+
+                c4 = ws_total.cell(row=r_idx, column=4, value=round(kwh_t, 3))
                 c4.number_format = "#,##0.000"
 
-                c5 = ws_total.cell(row=r_idx, column=5)
-                c5.value = f"=IF(ISNUMBER('{esc}'!${vl}$1), '{esc}'!${vl}$1, SUM('{esc}'!${vl}${srow}:${vl}${lrow})*$C{r_idx})"
+                c5 = ws_total.cell(row=r_idx, column=5, value=round(kvar_t, 3))
                 c5.number_format = "#,##0.000"
-                
-                c6 = ws_total.cell(row=r_idx, column=6)
-                if isinstance(kw_formula, str):
-                    c6.value = kw_formula
-                else:
-                    c6.value = 0
+
+                c6 = ws_total.cell(row=r_idx, column=6, value=round(kw_val, 3))
                 c6.number_format = "#,##0.000"
                 c6.fill = yellow_fill
                 c6.font = Font(bold=True)
-                
+
                 for col_idx in range(1, 7):
                     ws_total.cell(row=r_idx, column=col_idx).border = border
                     ws_total.cell(row=r_idx, column=col_idx).alignment = Alignment(horizontal="center" if col_idx in (1, 3) else "right" if col_idx > 3 else "left")
@@ -899,6 +970,15 @@ class CSVUploaderApp:
         self.append_info(msg)
         if ok and getattr(self.csv_processor, "combined_df", None) is not None:
             self.last_results = results
+            # Apply CSV-extracted scale factors as defaults for companies not yet configured
+            scale_factors = results.get("scale_factors", {})
+            changed = False
+            for company, sf in scale_factors.items():
+                if company not in self.company_multipliers and sf > 1:
+                    self.company_multipliers[company] = sf
+                    changed = True
+            if changed:
+                self._save_multipliers_config()
             if hasattr(self, "export_excel_btn"):
                 self.export_excel_btn.configure(state="normal")
             if hasattr(self, "export_csv_btn"):
@@ -906,6 +986,8 @@ class CSVUploaderApp:
             self.populate_companies()
             cs = results.get("combined_stats", {})
             self.append_info(f"Filas: {cs.get('total_rows', 0)}  Columnas: {cs.get('total_columns', 0)}  Resolución: {cs.get('resolution', '')}")
+            if scale_factors:
+                self.append_info(f"Factores de escala detectados: {', '.join(f'{k}={v}' for k,v in scale_factors.items())}")
         else:
             self.append_info("Sin resultados para exportar.")
             self.company_cb.configure(state="disabled")
