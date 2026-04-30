@@ -30,6 +30,7 @@ try:
 except Exception:
     run_ui = None
 from src.csv_processor import CSVProcessor
+from config.default_multipliers import lookup_default_multiplier
 
 
 MONTH_ABBR_ES = {
@@ -92,21 +93,47 @@ class CSVUploaderApp:
         return Path.home() / "Downloads" / "BILLREAD_WORKSPACE" / "multipliers.json"
 
     def _load_multipliers_config(self) -> dict:
+        """Carga los overrides manuales del usuario (JSON).
+        Solo contiene valores que el usuario cambió explícitamente en la UI."""
         p = self._multipliers_cfg_path()
         if p.exists():
             try:
                 with open(p, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    # Formato nuevo: {"overrides": {...}}
+                    if isinstance(data, dict) and "overrides" in data:
+                        return data["overrides"]
+                    # Formato legacy: dict plano — descartarlo para evitar
+                    # que valores viejos (80) sobreescriban los defaults correctos
+                    return {}
             except Exception:
                 pass
         return {}
 
+    def _resolve_multiplier(self, company: str) -> float:
+        """Devuelve el multiplo para una empresa.
+        Prioridad:
+          1. Override manual del usuario (guardado explícitamente en la UI).
+          2. Catálogo de defaults por empresa (fuente de verdad oficial).
+          3. Multiplo global del spinbox."""
+        # 1. Override del usuario
+        if company in self.company_multipliers:
+            return float(self.company_multipliers[company])
+        # 2. Catálogo oficial
+        default = lookup_default_multiplier(company)
+        if default is not None:
+            return float(default)
+        # 3. Fallback global
+        return float(getattr(self, "default_multiplier", 80))
+
     def _save_multipliers_config(self):
+        """Guarda solo los overrides manuales del usuario."""
         p = self._multipliers_cfg_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(p, "w", encoding="utf-8") as f:
-                json.dump(self.company_multipliers, f, indent=2, ensure_ascii=False)
+                json.dump({"overrides": self.company_multipliers},
+                          f, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -147,7 +174,7 @@ class CSVUploaderApp:
         for i, company in enumerate(companies):
             ttk.Label(scroll_frame, text=str(company)[:45]).grid(row=i, column=0, sticky="w", pady=2, padx=4)
             entry = ttk.Entry(scroll_frame, width=10)
-            current = self.company_multipliers.get(company, getattr(self, "default_multiplier", 80))
+            current = self._resolve_multiplier(company)
             entry.insert(0, str(int(current)) if float(current) == int(float(current)) else str(current))
             entry.grid(row=i, column=1, sticky="w", padx=(8, 0), pady=2)
             entries[company] = entry
@@ -576,9 +603,7 @@ class CSVUploaderApp:
         company = self.company_cb.get()
         if not company:
             return
-        val = self.company_multipliers.get(company)
-        if val is None:
-            val = getattr(self, 'default_multiplier', 80)
+        val = self._resolve_multiplier(company)
         try:
             self.multiplier_sp.set(str(int(val)))
         except Exception:
@@ -845,7 +870,7 @@ class CSVUploaderApp:
             factor_demanda = 1 if self.resolution.get() == "1h" else 4
 
             for idx, company in enumerate(companies, start=1):
-                m = float(self.company_multipliers.get(company, getattr(self, 'default_multiplier', 80)))
+                m = self._resolve_multiplier(company)
                 if selected_company and company == selected_company and (selected_multiplo is not None):
                     m = float(selected_multiplo)
                     self.company_multipliers[company] = m
